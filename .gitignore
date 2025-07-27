@@ -3,8 +3,8 @@ venv/
 
 # Docker Compose environment variables / local configurations
 .env
-docker-compose.yml # 안 올릴 파일1
-mosquitto_config/mosquitto.conf # 안 올릴 파일2
+docker-compose.yml
+mosquitto_config/mosquitto.conf
 influxdb_data/
 redis_data/
 mosquitto_data/
