@@ -7,8 +7,8 @@ import redis
 from datetime import datetime
 
 # .env 파일에서 환경 변수 로드
-# from dotenv import load_dotenv
-# load_dotenv()
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- 환경 변수 가져오기 ---
 MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST')
