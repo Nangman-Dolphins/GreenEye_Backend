@@ -1,0 +1,15 @@
+# Python virtual environment
+venv/
+
+# Docker Compose environment variables / local configurations
+.env
+docker-compose.yml # 안 올릴 파일1
+mosquitto_config/mosquitto.conf # 안 올릴 파일2
+influxdb_data/
+redis_data/
+mosquitto_data/
+mosquitto_log/
+
+# Python specific
+__pycache__/
+*.pyc
