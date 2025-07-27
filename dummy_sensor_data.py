@@ -14,7 +14,7 @@ load_dotenv()
 MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
 MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT', 1883))
 MQTT_USERNAME = os.getenv('MQTT_USERNAME', 'greeneye_user')
-MQTT_PASSWORD = os.getenv('MQTT_PASSWORD', 'kitel1976!') # 실제 비밀번호로 바꿔야 함
+MQTT_PASSWORD = os.getenv('MQTT_PASSWORD', 'kitel1976!')
 
 # --- MQTT 클라이언트 설정 ---
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
@@ -42,7 +42,7 @@ except Exception as e:
 
 # --- 더미 데이터 발행 로직 ---
 plant_id_list = ["plant_001", "plant_002", "plant_003"] # 테스트할 식물 ID 목록
-sensor_read_interval_sec = 5 # 데이터를 발행할 주기 (초)
+sensor_read_interval_sec = 5 # 데이터를 발행할 주기
 
 print(f"\n--- Starting dummy sensor data publishing every {sensor_read_interval_sec} seconds ---")
 print(f"Publishing to topics: sensor/data/{{plant_id}} for {', '.join(plant_id_list)}")
