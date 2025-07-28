@@ -65,8 +65,8 @@ with app.app_context():
         print(f"Scheduled auto control job for {p_id} every 60 seconds.")
     
     # 2. 월별 보고서 발송 작업 추가
-    # 주의: 지금은 테스트용으로 매일 00시 05분에 실행되도록 설정.
-    #       실제 배포 시에는 매월 1일 특정 시간으로 변경 (e.g., 'cron', day='1', hour='0', minute='5')
+    #       일단 매일 00시 05분에 실행되도록 설정.
+    #       실제 배포 시에는 매월 1일 특정 시간으로 변경할까 생각중 (e.g., 'cron', day='1', hour='0', minute='5')
     scheduler.add_job(func=send_monthly_reports_for_users, trigger='cron', hour='0', minute='5', id='monthly_report_job', timezone='Asia/Seoul')
     print("Scheduled monthly report job to run daily at 00:05 (for testing).")
     
