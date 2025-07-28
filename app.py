@@ -1,5 +1,3 @@
-# app.py (수정된 내용 - APScheduler 통합)
-
 import os
 from flask import Flask, jsonify, request, send_from_directory
 from dotenv import load_dotenv
@@ -10,6 +8,7 @@ from werkzeug.utils import secure_filename
 import uuid
 
 from apscheduler.schedulers.background import BackgroundScheduler # 스케줄러 임포트
+import pytz # 시간대 처리를 위해 추가
 
 # services.py에서 정의한 함수들을 import
 from services import initialize_services, mqtt_client, get_redis_data, query_influxdb_data, publish_mqtt_message, process_sensor_data, set_redis_data
@@ -18,7 +17,10 @@ from services import initialize_services, mqtt_client, get_redis_data, query_inf
 from database import init_db, add_user, get_user_by_email, check_password, get_db_connection
 
 # control_logic.py에서 정의한 함수들을 import
-from control_logic import handle_manual_control, check_and_apply_auto_control # check_and_apply_auto_control 추가
+from control_logic import handle_manual_control, check_and_apply_auto_control
+
+# report_generator.py에서 정의한 함수들을 import
+from report_generator import send_monthly_reports_for_users # 새로 추가
 
 
 # .env 파일에서 환경 변수 로드
@@ -53,20 +55,23 @@ with app.app_context():
     print("--- All backend services and DB initialized. ---\n")
 
     # --- APScheduler 초기화 및 작업 추가 ---
-    # 자동 제어 로직을 주기적으로 실행하도록 스케줄링
     scheduler = BackgroundScheduler(daemon=True) # daemon=True로 설정하여 앱 종료 시 함께 종료
     
-    # 등록할 식물 ID 리스트 (더미 데이터에서 사용 중인 ID)
-    plant_ids_to_monitor = ["plant_001", "plant_002", "plant_003"] 
-
-    # 각 식물 ID에 대해 check_and_apply_auto_control 함수를 주기적으로 실행하도록 작업 추가
+    # 1. 자동 제어 작업 추가
+    plant_ids_to_monitor = ["plant_001", "plant_002", "plant_003"] # 더미 센서에서 사용하는 식물 ID 리스트
     for p_id in plant_ids_to_monitor:
         # 'interval'은 매 60초(1분)마다 실행 (센서 데이터가 5초마다 오니 1분에 한 번만 검사해도 충분)
         scheduler.add_job(func=check_and_apply_auto_control, trigger='interval', seconds=60, args=[p_id], id=f'auto_control_job_{p_id}')
         print(f"Scheduled auto control job for {p_id} every 60 seconds.")
     
+    # 2. 월별 보고서 발송 작업 추가
+    # 주의: 지금은 테스트용으로 매일 00시 05분에 실행되도록 설정.
+    #       실제 배포 시에는 매월 1일 특정 시간으로 변경 (e.g., 'cron', day='1', hour='0', minute='5')
+    scheduler.add_job(func=send_monthly_reports_for_users, trigger='cron', hour='0', minute='5', id='monthly_report_job', timezone='Asia/Seoul')
+    print("Scheduled monthly report job to run daily at 00:05 (for testing).")
+    
     scheduler.start() # 스케줄러 시작
-    print("APScheduler started for auto control tasks.")
+    print("APScheduler started for auto control and report tasks.")
 
 # --- 기본 라우트 (API 엔드포인트) 정의 ---
 
