@@ -13,3 +13,6 @@ mosquitto_log/
 # Python specific
 __pycache__/
 *.pyc
+
+# 이미지 업로드 폴더
+images/
