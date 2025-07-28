@@ -6,7 +6,8 @@ import json
 from datetime import datetime
 
 # services.py에서 정의한 함수들을 import
-from services import initialize_services, mqtt_client, get_redis_data, query_influxdb_data, publish_mqtt_message, process_sensor_data
+from services import initialize_services, mqtt_client, get_redis_data, query_influxdb_data, publish_mqtt_message, process_sensor_data, set_redis_data # set_redis_data 추가
+
 # database.py에서 정의한 함수들을 import
 from database import init_db, add_user, get_user_by_email, check_password
 
