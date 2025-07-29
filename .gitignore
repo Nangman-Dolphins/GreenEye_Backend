@@ -16,3 +16,6 @@ __pycache__/
 
 # 이미지 업로드 폴더
 images/
+
+# nginx 로컬 설정 폴더
+nginx_config/
