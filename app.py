@@ -1,34 +1,50 @@
 import os
+import json
+import uuid
+import pytz
+from datetime import datetime, timedelta
+
+# Flask 프레임워크 관련 라이브러리
 from flask import Flask, jsonify, request, send_from_directory
 from dotenv import load_dotenv
-import time
-import json
-from datetime import datetime
-from werkzeug.utils import secure_filename
-import uuid
 
-from apscheduler.schedulers.background import BackgroundScheduler # 스케줄러 임포트
-import pytz # 시간대 처리를 위해 추가
+# 스케줄링을 위한 라이브러리
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# services.py에서 정의한 함수들을 import
-from services import initialize_services, mqtt_client, get_redis_data, query_influxdb_data, publish_mqtt_message, process_sensor_data, set_redis_data
-
-# database.py에서 정의한 함수들을 import
-from database import init_db, add_user, get_user_by_email, check_password, get_db_connection
-
-# control_logic.py에서 정의한 함수들을 import
-from control_logic import handle_manual_control, check_and_apply_auto_control
-
-# report_generator.py에서 정의한 함수들을 import
-from report_generator import send_monthly_reports_for_users # 새로 추가
-
+# 프로젝트 내부 모듈 import
+from services import (
+    initialize_services,
+    mqtt_client,
+    get_redis_data,
+    query_influxdb_data,
+    publish_mqtt_message,
+    process_sensor_data,
+    process_image_data,
+    set_redis_data
+)
+from database import (
+    init_db,
+    add_user,
+    get_user_by_email,
+    check_password,
+    get_db_connection,
+    add_device,
+    get_device_by_friendly_name,
+    get_device_by_mac
+)
+from control_logic import (
+    handle_manual_control,
+    check_and_apply_auto_control
+)
+from report_generator import send_monthly_reports_for_users
 
 # .env 파일에서 환경 변수 로드
 load_dotenv()
 
 app = Flask(__name__)
 
-# --- 환경 변수 설정 (나머지 동일) ---
+# --- 환경 변수 설정 ---
+# 이 변수들은 .env 파일에 실제 값으로 저장될 거야.
 MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
 MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT', 1883))
 MQTT_USERNAME = os.getenv('MQTT_USERNAME', 'greeneye_user')
@@ -45,158 +61,130 @@ REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', 'kitel1976!')
 
 app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'super_secret_key_for_dev')
 
+# 이미지 저장 폴더 (Nginx와 공유)
+IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'images')
 
 # --- Flask 앱 시작 시 서비스 초기화 및 DB 초기화 ---
 with app.app_context():
     initialize_services()
+    
+    # MQTT 구독: 센서 데이터와 이미지 데이터 토픽 모두 구독
+    # (주의: 단말기가 MAC 주소를 포함하여 토픽을 보내도록 변경됨)
     mqtt_client.subscribe("sensor/data/#")
-    print("Subscribed to MQTT topic 'sensor/data/#'")
+    mqtt_client.subscribe("image/data/#")
+    print("Subscribed to MQTT topics 'sensor/data/#' and 'image/data/#'")
+    
+    # SQLite 데이터베이스 초기화 (users, devices, plant_images 테이블 생성 등)
     init_db()
     print("--- All backend services and DB initialized. ---\n")
 
     # --- APScheduler 초기화 및 작업 추가 ---
-    scheduler = BackgroundScheduler(daemon=True) # daemon=True로 설정하여 앱 종료 시 함께 종료
+    scheduler = BackgroundScheduler(daemon=True)
+    plant_friendly_names = ["Plant1", "Plant2", "Plant3"] # 테스트를 위한 임시 이름
+
+    for p_name in plant_friendly_names:
+        scheduler.add_job(func=check_and_apply_auto_control, trigger='interval', seconds=60, args=[p_name], id=f'auto_control_job_{p_name}')
+        print(f"Scheduled auto control job for {p_name} every 60 seconds.")
     
-    # 1. 자동 제어 작업 추가
-    plant_ids_to_monitor = ["plant_001", "plant_002", "plant_003"] # 더미 센서에서 사용하는 식물 ID 리스트
-    for p_id in plant_ids_to_monitor:
-        # 'interval'은 매 60초(1분)마다 실행 (센서 데이터가 5초마다 오니 1분에 한 번만 검사해도 충분)
-        scheduler.add_job(func=check_and_apply_auto_control, trigger='interval', seconds=60, args=[p_id], id=f'auto_control_job_{p_id}')
-        print(f"Scheduled auto control job for {p_id} every 60 seconds.")
-    
-    # 2. 월별 보고서 발송 작업 추가
-    #       일단 매일 00시 05분에 실행되도록 설정.
-    #       실제 배포 시에는 매월 1일 특정 시간으로 변경할까 생각중 (e.g., 'cron', day='1', hour='0', minute='5')
     scheduler.add_job(func=send_monthly_reports_for_users, trigger='cron', hour='0', minute='5', id='monthly_report_job', timezone='Asia/Seoul')
     print("Scheduled monthly report job to run daily at 00:05 (for testing).")
     
-    scheduler.start() # 스케줄러 시작
+    scheduler.start()
     print("APScheduler started for auto control and report tasks.")
+
 
 # --- 기본 라우트 (API 엔드포인트) 정의 ---
 
 @app.route('/')
 def home():
+    """기본 홈 페이지 응답"""
     return "Hello, GreenEye Backend is running!"
 
 @app.route('/api/status')
 def status():
+    """백엔드 API의 상태를 확인하는 엔드포인트"""
     return jsonify({"status": "ok", "message": "Backend API is working!"})
 
-@app.route('/api/latest_sensor_data/<plant_id>')
-def get_latest_sensor_data(plant_id):
-    data = get_redis_data(f"latest_sensor_data:{plant_id}")
+@app.route('/api/latest_sensor_data/<plant_friendly_name>')
+def get_latest_sensor_data(plant_friendly_name):
+    """
+    Redis에서 특정 식물의 최신 5가지 센서 데이터를 가져오는 API.
+    GET 요청으로, 프론트엔드에서 최신 데이터를 표시할 때 사용합니다.
+    """
+    device = get_device_by_friendly_name(plant_friendly_name)
+    if not device:
+        return jsonify({"error": "Device not found with this friendly name"}), 404
+    
+    data = get_redis_data(f"latest_sensor_data:{device['mac_address']}")
     if data:
+        # 응답에 plant_friendly_name 포함
+        data['plant_friendly_name'] = plant_friendly_name
         return jsonify(data)
     return jsonify({"error": "No data found for this plant ID"}), 404
 
-@app.route('/api/historical_sensor_data/<plant_id>')
-def get_historical_sensor_data(plant_id):
+@app.route('/api/historical_sensor_data/<plant_friendly_name>')
+def get_historical_sensor_data(plant_friendly_name):
+    """
+    InfluxDB에서 특정 식물의 과거 센서 데이터를 조회하는 API.
+    GET 요청으로, 프론트엔드에서 통계나 그래프를 그릴 때 사용합니다.
+    """
+    device = get_device_by_friendly_name(plant_friendly_name)
+    if not device:
+        return jsonify({"error": "Device not found with this friendly name"}), 404
+        
+    # Flux 쿼리 예시: 특정 MAC 주소의 지난 7일 센서 데이터 조회
     query = f'''
     from(bucket: "{INFLUXDB_BUCKET}")
-      |> range(start: -24h)
+      |> range(start: -7d)
       |> filter(fn: (r) => r._measurement == "sensor_readings")
-      |> filter(fn: (r) => r.plant_id == "{plant_id}")
+      |> filter(fn: (r) => r.mac_address == "{device['mac_address']}")
       |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
-      |> keep(columns: ["_time", "plant_id", "temperature", "humidity", "light_lux", "soil_moisture", "soil_ec"])
+      |> keep(columns: ["_time", "mac_address", "temperature", "humidity", "light_lux", "soil_moisture", "soil_ec"])
       |> yield(name: "mean")
     '''
     data = query_influxdb_data(query)
     
     formatted_data = []
     for record in data:
+        record['plant_friendly_name'] = plant_friendly_name
         formatted_data.append(record)
     return jsonify(formatted_data)
 
-@app.route('/api/control_plant/<plant_id>', methods=['POST'])
-def control_plant(plant_id):
+@app.route('/api/control_plant/<plant_friendly_name>', methods=['POST'])
+def control_plant(plant_friendly_name):
     """
     MQTT를 통해 식물 제어 명령을 발행하는 API.
     POST 요청으로, 웹에서 JSON 형식의 명령을 받습니다. (수동 제어용)
-    이제 control_logic.py 모듈을 통해 처리됩니다.
     """
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
 
+    device = get_device_by_friendly_name(plant_friendly_name)
+    if not device:
+        return jsonify({"error": "Device not found with this friendly name"}), 404
+        
     command_data = request.get_json()
-    action = command_data.get('action') # 예: "turn_on_water_pump"
-    duration = command_data.get('duration_sec', 0) # 예: 10 (초)
-    device = command_data.get('device') # 제어할 장치 (예: "water_pump", "led", "humidifier")
+    action = command_data.get('action')
+    duration = command_data.get('duration_sec', 0)
+    device_type = command_data.get('device')
 
-    if not action or not device:
+    if not action or not device_type:
         return jsonify({"error": "Missing 'action' or 'device' in command"}), 400
     
-    # --- control_logic.py의 handle_manual_control 함수 호출 ---
-    # 이제 publish_mqtt_message 와 set_redis_data 호출을 handle_manual_control 함수로 대체합니다.
-    result = handle_manual_control(plant_id, device, action, duration) # <--- 이 부분으로 변경해주세요!
+    result = handle_manual_control(device['mac_address'], device_type, action, duration)
     return jsonify(result), (200 if result.get("status") == "success" else 500)
 
 
-# --- 이미지 업로드 및 조회 API 엔드포인트 ---
-IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'images')
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
-
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-@app.route('/api/upload_image/<plant_id>', methods=['POST'])
-def upload_image(plant_id):
-    if 'image' not in request.files:
-        return jsonify({"error": "No image file part in the request"}), 400
-    
-    file = request.files['image']
-    
-    if file.filename == '':
-        return jsonify({"error": "No selected image file"}), 400
-    
-    if file and allowed_file(file.filename):
-        original_filename = secure_filename(file.filename)
-        file_extension = original_filename.rsplit('.', 1)[1].lower()
-        unique_filename = f"{plant_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{file_extension}"
-        
-        filepath = os.path.join(IMAGE_UPLOAD_FOLDER, unique_filename)
-        
-        try:
-            file.save(filepath)
-            
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "CREATE TABLE IF NOT EXISTS plant_images (id INTEGER PRIMARY KEY AUTOINCREMENT, plant_id TEXT NOT NULL, filename TEXT NOT NULL UNIQUE, filepath TEXT NOT NULL, timestamp TEXT NOT NULL)",
-                ()
-            )
-            cursor.execute(
-                "INSERT INTO plant_images (plant_id, filename, filepath, timestamp) VALUES (?, ?, ?, ?)",
-                (plant_id, unique_filename, filepath, datetime.utcnow().isoformat())
-            )
-            conn.commit()
-            conn.close()
-
-            set_redis_data(f"latest_image:{plant_id}", {
-                "filename": unique_filename,
-                "filepath": filepath,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-
-            print(f"Image uploaded and saved: {filepath}")
-            # 이 시점에서 AI 추론 로직을 호출 (나중에 추가)
-            # from ai_inference import run_inference_on_image
-            # diagnosis_result = run_inference_on_image(filepath)
-            # set_redis_data(f"latest_ai_diagnosis:{plant_id}", {"diagnosis": diagnosis_result, "timestamp": datetime.utcnow().isoformat()})
-
-            return jsonify({"status": "success", "message": "Image uploaded successfully", "filename": unique_filename}), 200
-        except Exception as e:
-            print(f"Error saving image or writing to DB: {e}")
-            return jsonify({"error": f"Server error: {e}"}), 500
-    else:
-        return jsonify({"error": "File type not allowed"}), 400
-
-@app.route('/api/images/<plant_id>/<filename>')
-def get_image(plant_id, filename):
+# --- 이미지 조회 API 엔드포인트 ---
+@app.route('/api/images/<plant_friendly_name>/<filename>')
+def get_image(plant_friendly_name, filename):
     """
     저장된 이미지 파일을 프론트엔드에 제공하는 API.
     """
+    device = get_device_by_friendly_name(plant_friendly_name)
+    if not device:
+        return jsonify({"error": "Device not found with this friendly name"}), 404
+        
     safe_filename = secure_filename(filename)
     
     filepath_to_serve = os.path.join(IMAGE_UPLOAD_FOLDER, safe_filename)
@@ -208,7 +196,7 @@ def get_image(plant_id, filename):
         return jsonify({"error": "Image not found"}), 404
 
 
-# --- 사용자 인증 API 엔드포인트 ---
+# --- 사용자 인증 및 장치 등록 API 엔드포인트 ---
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
     if not request.is_json:
@@ -248,6 +236,30 @@ def login_user():
         return jsonify({"status": "success", "message": "Logged in successfully", "token": "dummy_jwt_token_for_now"}), 200
     else:
         return jsonify({"error": "Invalid email or password"}), 401
+
+@app.route('/api/register_device', methods=['POST'])
+def register_device():
+    """
+    사용자가 MAC 주소를 입력하여 단말기를 등록하는 API.
+    """
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+        
+    data = request.get_json()
+    mac_address = data.get('mac_address')
+    plant_friendly_name = data.get('plant_friendly_name')
+
+    if not mac_address or not plant_friendly_name:
+        return jsonify({"error": "MAC address and plant friendly name are required"}), 400
+
+    # MAC 주소 형식 검사 (간단한 예시)
+    # if not all(c in '0123456789abcdefABCDEF:' for c in mac_address) or len(mac_address) != 17:
+    #     return jsonify({"error": "Invalid MAC address format"}), 400
+
+    if add_device(mac_address, plant_friendly_name):
+        return jsonify({"status": "success", "plant_friendly_name": plant_friendly_name, "mac_address": mac_address, "message": "Device registered successfully"}), 201
+    else:
+        return jsonify({"error": "Device with this MAC address or friendly name already exists"}), 409
 
 
 # --- 앱 실행 부분 ---

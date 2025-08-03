@@ -1,56 +1,58 @@
-version: '3.8'
+version: '3.8' # Docker Compose 파일 형식 버전
 
-services:
+services: # 실행할 서비스 정의
   # --- Mosquitto MQTT Broker ---
   mosquitto:
-    image: eclipse-mosquitto:2.0.15
-    container_name: greeneye_mosquitto
-    ports:
-      - "1883:1883"
-      - "8883:8883"
-    volumes:
-      - ./mosquitto_config:/mosquitto/config
-      - mosquitto_data:/mosquitto/data
-      - mosquitto_log:/mosquitto/log
-    restart: unless-stopped
+    image: eclipse-mosquitto:2.0.15 # 사용할 Docker 이미지 이름:버전. 안정적인 2.0.15 버전을 사용
+    container_name: greeneye_mosquitto # 컨테이너 이름. 나중에 'docker ps'로 확인.
+    ports: # PC의 포트와 컨테이너 내부의 포트를 연결하는 부분
+      - "1883:1883" # PC의 1883번 포트 -> 컨테이너 내부의 1883번 포트 (일반 MQTT 통신용)
+      - "8883:8883" # PC의 8883번 포트 -> 컨테이너 내부의 8883번 포트 (MQTT over TLS/SSL 통신용(테스트))
+    volumes: # 컨테이너 내부의 특정 폴더를 PC의 폴더와 연결
+      - ./mosquitto_config:/mosquitto/config # 여기에 Mosquitto 설정 파일이 들어감.
+      - mosquitto_data:/mosquitto/data # Mosquitto가 메시지를 저장하는 데이터 볼륨
+      - mosquitto_log:/mosquitto/log # Mosquitto 로그 파일이 저장될 볼륨
+    restart: unless-stopped # 컨테이너가 어떤 이유로든 멈추면 자동으로 다시 시작.
 
-  # --- InfluxDB ---
+  # --- InfluxDB Time-Series Database ---
   influxdb:
-    image: influxdb:2.7.5
-    container_name: greeneye_influxdb
+    image: influxdb:2.7.5 # InfluxDB Docker 이미지 이름:버전. 안정적인 2.7.5 버전을 사용
+    container_name: greeneye_influxdb # 이 컨테이너의 이름
     ports:
-      - "8086:8086"
+      - "8086:8086" # PC의 8086번 포트 -> 컨테이너 내부의 8086번 포트 (InfluxDB 웹 UI 및 API 접속용)
     volumes:
-      - influxdb_data:/var/lib/influxdb2
-    environment:
-      - DOCKER_INFLUXDB_INIT_MODE=setup
-      - DOCKER_INFLUXDB_INIT_USERNAME=greeneye_admin
-      - DOCKER_INFLUXDB_INIT_PASSWORD=kitel1976!
-      - DOCKER_INFLUXDB_INIT_ORG=GreenEye
-      - DOCKER_INFLUXDB_INIT_BUCKET=sensor_data
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=5be92638-5260-458c-8287-2ce175a387aa
+      - influxdb_data:/var/lib/influxdb2 # InfluxDB 데이터가 저장될 볼륨
+    environment: # InfluxDB 초기 설정에 필요한 환경 변수들
+      - DOCKER_INFLUXDB_INIT_MODE=setup # 초기 설정 모드를 'setup'으로 지정
+      - DOCKER_INFLUXDB_INIT_USERNAME=greeneye_admin # **사용할 InfluxDB 관리자 사용자명**
+      - DOCKER_INFLUXDB_INIT_PASSWORD=kitel1976! # 사용할 InfluxDB 관리자 비밀번호
+      - DOCKER_INFLUXDB_INIT_ORG=GreenEye # **InfluxDB 조직명**
+      - DOCKER_INFLUXDB_INIT_BUCKET=sensor_data # **초기 생성될 기본 데이터 버킷**
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=5be92638-5260-458c-8287-2ce175a387aa # **InfluxDB 관리자 API 토큰**
     restart: unless-stopped
 
-  # --- Redis ---
+  # --- Redis Cache 서비스 정의 ---
   redis:
-    image: redis:7.0.12-alpine
-    container_name: greeneye_redis
+    image: redis:7.0.12-alpine # 가볍고 안정적인 Redis 이미지
+    container_name: greeneye_redis # 이 컨테이너의 이름
     ports:
-      - "6379:6379"
-    command: redis-server --requirepass kitel1976!
+      - "6379:6379" # PC의 6379번 포트 -> 컨테이너 내부의 6379번 포트 (Redis 접속용)
+    command: redis-server --requirepass kitel1976! # **Redis 서버 시작 명령과 함께 비밀번호 설정**
     volumes:
-      - redis_data:/data
+      - redis_data:/data # Redis 데이터가 저장될 볼륨
     restart: unless-stopped
 
-  # --- Nginx (default.conf 방식) ---
+ # --- Nginx Web Server / Reverse Proxy ---
   nginx:
-    image: nginx:1.25.1-alpine
-    container_name: greeneye_nginx
+    image: nginx:1.25.1-alpine # 가볍고 안정적인 Nginx 이미지
+    container_name: greeneye_nginx # Nginx 컨테이너 이름
     ports:
-      - "80:80"
+      - "80:80" # PC의 80번 포트 -> 컨테이너 내부의 80번 포트 (웹 서비스 접근용)
+      # HTTPS를 나중에 추가할 때 443번 포트도 여기에 추가
+      # - "443:443"
     volumes:
       - ./nginx_config/default.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./images:/app/images:ro
+      - ./images:/app/images:ro # Flask 앱이 저장하는 이미지 폴더를 Nginx가 읽을 수 있도록 마운트
     depends_on:
       - influxdb
       - redis

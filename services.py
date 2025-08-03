@@ -5,6 +5,11 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 import redis
 from datetime import datetime
+import base64
+from werkzeug.utils import secure_filename
+
+# database.py에서 필요한 함수 임포트 (SQLite에 이미지 메타데이터 저장용)
+from database import get_db_connection
 
 # .env 파일에서 환경 변수 로드
 from dotenv import load_dotenv
@@ -25,6 +30,8 @@ REDIS_HOST = os.getenv('REDIS_HOST')
 REDIS_PORT = int(os.getenv('REDIS_PORT'))
 REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
 
+# 이미지 저장 폴더 (app.py와 동일한 경로)
+IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'images')
 
 # --- MQTT 클라이언트 설정 ---
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
@@ -32,20 +39,31 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print(f"MQTT Broker Connected successfully with result code {rc}")
-        # 여기에 구독할 토픽을 추가
-        # client.subscribe("sensor/data")
     else:
         print(f"Failed to connect, return code {rc}\n")
 
 def on_message(client, userdata, msg):
-    print(f"MQTT Message received: Topic - {msg.topic}, Payload - {msg.payload.decode()}")
-    try:
-        payload = json.loads(msg.payload.decode('utf-8'))
-        process_sensor_data(msg.topic, payload) # 수신된 데이터를 처리하는 함수 호출
-    except json.JSONDecodeError:
-        print(f"Error decoding JSON from MQTT payload: {msg.payload.decode()}")
-    except Exception as e:
-        print(f"Error processing MQTT message: {e}")
+    print(f"MQTT Message received: Topic - {msg.topic}, Payload length - {len(msg.payload)}")
+    
+    # 토픽에 따라 센서 데이터와 이미지 데이터를 다르게 처리
+    if msg.topic.startswith("sensor/data/"):
+        try:
+            payload = json.loads(msg.payload.decode('utf-8'))
+            process_sensor_data(msg.topic, payload)
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON from MQTT payload (sensor): {msg.payload.decode()}")
+        except Exception as e:
+            print(f"Error processing MQTT sensor message: {e}")
+    elif msg.topic.startswith("image/data/"):
+        try:
+            payload = json.loads(msg.payload.decode('utf-8'))
+            process_image_data(msg.topic, payload)
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON from MQTT payload (image): {msg.payload.decode()}")
+        except Exception as e:
+            print(f"Error processing MQTT image message: {e}")
+    else:
+        print(f"Unhandled MQTT topic: {msg.topic}")
 
 def connect_mqtt():
     mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
@@ -156,48 +174,117 @@ def get_redis_data(key):
 def process_sensor_data(topic, payload):
     """
     MQTT로 수신된 센서 데이터를 InfluxDB에 저장하고 Redis에 캐시하는 함수.
-    5가지 센서 값을 처리
+    5가지 센서 값(온도, 습도, 조도, 토양 수분, 토양 전도도)을 처리합니다.
     """
     try:
-        # 토픽에서 plant_id 추출 ("sensor/data/plant_001")
+        # MAC 주소를 토픽에서 추출 (예: "sensor/data/AA:BB:CC:DD:EE:FF")
         topic_parts = topic.split('/')
         if len(topic_parts) >= 3 and topic_parts[0] == "sensor" and topic_parts[1] == "data":
-            plant_id = topic_parts[2]
+            mac_address = topic_parts[2]
         else:
-            print(f"Invalid MQTT topic format: {topic}")
+            print(f"Invalid MQTT topic format for sensor data: {topic}")
             return
 
         # InfluxDB에 저장할 데이터 준비
         # measurement: 'sensor_readings' (측정값의 종류)
-        # tags: 어떤 식물에서 온 데이터인지 식별 (plant_id)
+        # tags: 어떤 단말기에서 온 데이터인지 식별 (mac_address)
         # fields: 실제 센서 값들
-        tags = {"plant_id": plant_id}
+        tags = {"mac_address": mac_address}
         fields = {
             "temperature": payload.get("temperature"),     # 온도
             "humidity": payload.get("humidity"),           # 습도
-            "light_lux": payload.get("light_lux"),         # 조도
+            "light_lux": payload.get("light_lux"),         # 조도 (lux)
             "soil_moisture": payload.get("soil_moisture"), # 토양 수분
-            "soil_ec": payload.get("soil_ec")              # 토양 전도도
+            "soil_ec": payload.get("soil_ec")              # 토양 전도도 (EC)
         }
+        # 9999 값을 None으로 처리 (InfluxDB에 저장되지 않도록)
+        for key, value in fields.items():
+            if value == 9999: # 9999로 전송된 오류값 처리
+                fields[key] = None
+        
         # None 값 필터링: InfluxDB는 None 값을 저장하지 않으므로 유효한 필드만 남김
         fields = {k: v for k, v in fields.items() if v is not None}
 
-        if fields: # 유효한 필드 데이터가 있을 때만 저장
+        if fields:
             write_sensor_data_to_influxdb("sensor_readings", tags, fields)
-
-            # Redis에 최신 데이터 캐시
-            # 키는 'latest_sensor_data:식물ID' 형식으로 저장.
             latest_data = {
                 "timestamp": datetime.utcnow().isoformat(), # ISO 형식 UTC 시간
-                "plant_id": plant_id,
-                **fields # 센서 필드 값들을 최신 데이터에 포함
+                "mac_address": mac_address,
+                **fields
             }
-            set_redis_data(f"latest_sensor_data:{plant_id}", latest_data)
+            set_redis_data(f"latest_sensor_data:{mac_address}", latest_data)
         else:
-            print(f"No valid sensor fields found in payload for {plant_id}. Payload: {payload}")
+            print(f"No valid sensor fields found in payload for {mac_address}. Payload: {payload}")
 
     except Exception as e:
         print(f"Error in process_sensor_data for topic {topic}: {e}")
+
+# --- 이미지 데이터 처리 로직 ---
+def process_image_data(topic, payload):
+    """
+    MQTT로 수신된 이미지 데이터를 Base64 디코딩하여 로컬에 저장하고 SQLite에 메타데이터를 저장합니다.
+    """
+    try:
+        # MAC 주소를 토픽에서 추출 (예: "image/data/AA:BB:CC:DD:EE:FF")
+        topic_parts = topic.split('/')
+        if len(topic_parts) >= 3 and topic_parts[0] == "image" and topic_parts[1] == "data":
+            mac_address = topic_parts[2]
+        else:
+            print(f"Invalid MQTT topic format for image data: {topic}")
+            return
+
+        image_base64 = payload.get("image_data_base64")
+        timestamp_str = payload.get("timestamp")
+
+        if not image_base64:
+            print(f"No Base64 image data found in payload for {mac_address}.")
+            return
+        
+        # Base64 디코딩
+        image_bytes = base64.b64decode(image_base64)
+        
+        # 안전한 파일 이름 생성 (MAC 주소 + 타임스탬프 + UUID)
+        file_extension = "jpg" # 단말기에서 JPEG로 보낼 것 가정
+        unique_filename = f"{secure_filename(mac_address)}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{file_extension}"
+        filepath = os.path.join(IMAGE_UPLOAD_FOLDER, unique_filename)
+
+        # 이미지 폴더가 없으면 생성
+        os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
+        
+        # 이미지 파일 로컬에 저장
+        with open(filepath, "wb") as f:
+            f.write(image_bytes)
+        
+        # SQLite에 이미지 메타데이터 저장
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS plant_images (id INTEGER PRIMARY KEY AUTOINCREMENT, mac_address TEXT NOT NULL, filename TEXT NOT NULL UNIQUE, filepath TEXT NOT NULL, timestamp TEXT NOT NULL)",
+            ()
+        )
+        cursor.execute(
+            "INSERT INTO plant_images (mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?)",
+            (mac_address, unique_filename, filepath, timestamp_str or datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+
+        # Redis에 최신 이미지 경로 캐싱 (AI 진단 결과와 함께 사용될 수 있음)
+        set_redis_data(f"latest_image:{mac_address}", {
+            "filename": unique_filename,
+            "filepath": filepath,
+            "timestamp": timestamp_str or datetime.utcnow().isoformat()
+        })
+
+        print(f"Image uploaded via MQTT and saved: {filepath}")
+
+        # 이 시점에서 AI 추론 로직을 호출 (나중에 추가)
+        # from ai_inference import run_inference_on_image
+        # diagnosis_result = run_inference_on_image(filepath)
+        # set_redis_data(f"latest_ai_diagnosis:{mac_address}", {"diagnosis": diagnosis_result, "timestamp": datetime.utcnow().isoformat()})
+
+    except Exception as e:
+        print(f"Error in process_image_data for topic {topic}: {e}")
 
 # --- 모든 서비스 연결 초기화 함수 ---
 def initialize_services():
