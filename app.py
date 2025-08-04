@@ -5,6 +5,7 @@ import pytz
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 import base64
+from werkzeug.utils import secure_filename
 
 # Flask 프레임워크 관련 라이브러리
 from flask import Flask, jsonify, request, send_from_directory
