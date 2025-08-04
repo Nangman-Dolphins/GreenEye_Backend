@@ -11,15 +11,15 @@ DB_PATH = os.path.join(BASE_DIR, DATABASE_FILE)
 def get_db_connection():
     """SQLite 데이터베이스 연결을 반환합니다."""
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = sqlite3.Row # 결과를 딕셔너리처럼 접근할 수 있게 설정
     return conn
 
 def init_db():
-    """데이터베이스를 초기화하고 user, devices 테이블을 생성합니다."""
+    """데이터베이스를 초기화하고 user, devices, plant_images 테이블을 생성합니다."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # users 테이블 (회원가입 정보)
+    # 1. user 테이블 (회원가입 정보)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,17 +28,17 @@ def init_db():
         )
     ''')
 
-    # devices 테이블 (MAC 주소, 친근한 이름 매핑)
+    # 2. devices 테이블 (단말기 등록 및 MAC-friendly_name 매핑용)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS devices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             mac_address TEXT UNIQUE NOT NULL,
-            plant_friendly_name TEXT UNIQUE NOT NULL,
+            friendly_name TEXT UNIQUE NOT NULL,
             registered_at TEXT NOT NULL
         )
     ''')
-    
-    # plant_images 테이블 (이미지 메타데이터)
+
+    # 3. plant_images 테이블 (이미지 메타데이터 저장용)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS plant_images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +48,6 @@ def init_db():
             timestamp TEXT NOT NULL
         )
     ''')
-
     conn.commit()
     conn.close()
     print(f"Database initialized and tables created at {DB_PATH}")
@@ -79,11 +78,20 @@ def get_user_by_email(email):
     conn.close()
     return user
 
+def get_all_users():
+    """모든 사용자를 조회합니다."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users")
+    users = cursor.fetchall()
+    conn.close()
+    return users
+
 def check_password(hashed_password, password):
     """해싱된 비밀번호와 입력된 비밀번호를 비교합니다."""
     return check_password_hash(hashed_password, password)
 
-def add_device(mac_address, plant_friendly_name):
+def add_device(mac_address, friendly_name):
     """새로운 단말기(MAC 주소)와 친근한 이름을 DB에 추가합니다."""
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -91,17 +99,17 @@ def add_device(mac_address, plant_friendly_name):
     registered_at = datetime.utcnow().isoformat()
     
     try:
-        cursor.execute("INSERT INTO devices (mac_address, plant_friendly_name, registered_at) VALUES (?, ?, ?)", 
-                       (mac_address, plant_friendly_name, registered_at))
+        cursor.execute("INSERT INTO devices (mac_address, friendly_name, registered_at) VALUES (?, ?, ?)", 
+                       (mac_address, friendly_name, registered_at))
         conn.commit()
-        print(f"Device '{mac_address}' added with friendly name '{plant_friendly_name}'.")
+        print(f"Device '{mac_address}' with name '{friendly_name}' added successfully.")
         return True
     except sqlite3.IntegrityError:
-        print(f"Device with MAC '{mac_address}' or friendly name '{plant_friendly_name}' already exists.")
+        print(f"Device with MAC address '{mac_address}' already exists.")
         return False
     finally:
         conn.close()
-        
+
 def get_device_by_mac(mac_address):
     """MAC 주소로 단말기 정보를 조회합니다."""
     conn = get_db_connection()
@@ -111,16 +119,25 @@ def get_device_by_mac(mac_address):
     conn.close()
     return device
     
-def get_device_by_friendly_name(plant_friendly_name):
+def get_device_by_friendly_name(friendly_name):
     """친근한 이름으로 단말기 정보를 조회합니다."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM devices WHERE plant_friendly_name = ?", (plant_friendly_name,))
+    cursor.execute("SELECT * FROM devices WHERE friendly_name = ?", (friendly_name,))
     device = cursor.fetchone()
     conn.close()
     return device
 
+def get_all_devices():
+    """모든 등록된 단말기를 조회합니다."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM devices")
+    devices = cursor.fetchall()
+    conn.close()
+    return devices
 
+# 이 파일을 직접 실행할 때만 DB를 초기화하도록 설정
 if __name__ == '__main__':
     init_db()
     print("Database ready.")

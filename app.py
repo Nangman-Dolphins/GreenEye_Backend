@@ -1,8 +1,4 @@
 import os
-from flask import Flask, jsonify, request, send_from_directory
-from flask_socketio import SocketIO, emit # SocketIO, emit 추가
-from dotenv import load_dotenv
-import time
 import json
 import uuid
 import pytz
@@ -10,6 +6,12 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 import base64
 
+# Flask 프레임워크 관련 라이브러리
+from flask import Flask, jsonify, request, send_from_directory
+from flask_socketio import SocketIO, emit # SocketIO, emit 추가
+from dotenv import load_dotenv
+
+# 스케줄링을 위한 라이브러리
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # 프로젝트 내부 모듈 import
@@ -31,7 +33,8 @@ from database import (
     get_db_connection,
     add_device,
     get_device_by_friendly_name,
-    get_device_by_mac
+    get_device_by_mac,
+    get_all_devices
 )
 from control_logic import (
     handle_manual_control,
@@ -48,6 +51,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 
 # --- 환경 변수 설정 ---
+# 이 변수들은 .env 파일에 실제 값으로 저장될 거야.
 MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
 MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT', 1883))
 MQTT_USERNAME = os.getenv('MQTT_USERNAME', 'greeneye_user')
@@ -80,7 +84,6 @@ def send_realtime_data_to_clients(mac_address):
             latest_data['latest_image_filename'] = latest_image_info['filename'] # 파일명만 보냄
         
         # 'realtime_data'라는 이벤트 이름으로 데이터를 브로드캐스트
-        # emit 함수를 사용해 클라이언트로 데이터 전송
         socketio.emit('realtime_data', latest_data)
         print(f"[WebSocket] Sent realtime data for {mac_address}.")
 
@@ -101,19 +104,23 @@ with app.app_context():
     # --- APScheduler 초기화 및 작업 추가 ---
     scheduler = BackgroundScheduler(daemon=True)
     
-    # 등록된 장치(DB)를 기준으로 스케줄러 등록 필요
-    # 더미 MAC 주소 사용
-    plant_mac_addresses = ["AA:BB:CC:DD:EE:F1", "AA:BB:CC:DD:EE:F2", "AA:BB:CC:DD:EE:F3"]
+    # database.py에서 등록된 모든 단말기 정보를 가져옵니다.
+    devices = get_all_devices()
+    
+    if not devices:
+        print("No devices found in DB. Skipping scheduler setup for auto control.")
+    else:
+        for device in devices:
+            mac_address = device['mac_address']
+            friendly_name = device['friendly_name']
 
-    for mac_addr in plant_mac_addresses:
-        # 1. 자동 제어 작업 추가
-        friendly_name = f"Plant{mac_addr[-1]}"
-        scheduler.add_job(func=check_and_apply_auto_control, trigger='interval', seconds=60, args=[mac_addr], id=f'auto_control_job_{mac_addr}')
-        print(f"Scheduled auto control job for {friendly_name} ({mac_addr}) every 60 seconds.")
-        
-        # 2. WebSocket으로 실시간 데이터 전송 작업 추가 (매 5초마다)
-        scheduler.add_job(func=send_realtime_data_to_clients, trigger='interval', seconds=5, args=[mac_addr], id=f'realtime_data_job_{mac_addr}')
-        print(f"Scheduled realtime data push for {friendly_name} ({mac_addr}) every 5 seconds.")
+            # 1. 자동 제어 작업 추가
+            scheduler.add_job(func=check_and_apply_auto_control, trigger='interval', seconds=60, args=[mac_address], id=f'auto_control_job_{mac_address}')
+            print(f"Scheduled auto control job for {friendly_name} ({mac_address}) every 60 seconds.")
+            
+            # 2. WebSocket으로 실시간 데이터 전송 작업 추가 (매 5초마다)
+            scheduler.add_job(func=send_realtime_data_to_clients, trigger='interval', seconds=5, args=[mac_address], id=f'realtime_data_job_{mac_address}')
+            print(f"Scheduled realtime data push for {friendly_name} ({mac_address}) every 5 seconds.")
 
     # 3. 월별 보고서 발송 작업 추가
     scheduler.add_job(func=send_monthly_reports_for_users, trigger='cron', hour='0', minute='5', id='monthly_report_job', timezone='Asia/Seoul')
