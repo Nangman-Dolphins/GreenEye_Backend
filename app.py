@@ -1,14 +1,15 @@
 import os
+from flask import Flask, jsonify, request, send_from_directory
+from flask_socketio import SocketIO, emit # SocketIO, emit 추가
+from dotenv import load_dotenv
+import time
 import json
 import uuid
 import pytz
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
+import base64
 
-# Flask 프레임워크 관련 라이브러리
-from flask import Flask, jsonify, request, send_from_directory
-from dotenv import load_dotenv
-
-# 스케줄링을 위한 라이브러리
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # 프로젝트 내부 모듈 import
@@ -42,9 +43,11 @@ from report_generator import send_monthly_reports_for_users
 load_dotenv()
 
 app = Flask(__name__)
+# Flask-SocketIO 객체 생성. CORS 문제를 해결하기 위해 origins='*' 설정
+socketio = SocketIO(app, cors_allowed_origins="*")
+
 
 # --- 환경 변수 설정 ---
-# 이 변수들은 .env 파일에 실제 값으로 저장될 거야.
 MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
 MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT', 1883))
 MQTT_USERNAME = os.getenv('MQTT_USERNAME', 'greeneye_user')
@@ -64,12 +67,29 @@ app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'super_secret_key_for_d
 # 이미지 저장 폴더 (Nginx와 공유)
 IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'images')
 
+# --- Redis에서 데이터 업데이트 시 WebSocket으로 알림 보내는 함수 ---
+def send_realtime_data_to_clients(mac_address):
+    """Redis에서 최신 데이터를 가져와 모든 WebSocket 클라이언트에게 브로드캐스트합니다."""
+    latest_data = get_redis_data(f"latest_sensor_data:{mac_address}")
+    latest_image_info = get_redis_data(f"latest_image:{mac_address}")
+    
+    if latest_data:
+        # 최신 이미지 정보와 AI 진단 결과를 센서 데이터와 합쳐서 보냄
+        # 지금은 AI 진단 결과가 없으므로 이미지 정보만 합침
+        if latest_image_info:
+            latest_data['latest_image_filename'] = latest_image_info['filename'] # 파일명만 보냄
+        
+        # 'realtime_data'라는 이벤트 이름으로 데이터를 브로드캐스트
+        # emit 함수를 사용해 클라이언트로 데이터 전송
+        socketio.emit('realtime_data', latest_data)
+        print(f"[WebSocket] Sent realtime data for {mac_address}.")
+
+
 # --- Flask 앱 시작 시 서비스 초기화 및 DB 초기화 ---
 with app.app_context():
     initialize_services()
     
     # MQTT 구독: 센서 데이터와 이미지 데이터 토픽 모두 구독
-    # (주의: 단말기가 MAC 주소를 포함하여 토픽을 보내도록 변경됨)
     mqtt_client.subscribe("sensor/data/#")
     mqtt_client.subscribe("image/data/#")
     print("Subscribed to MQTT topics 'sensor/data/#' and 'image/data/#'")
@@ -80,12 +100,22 @@ with app.app_context():
 
     # --- APScheduler 초기화 및 작업 추가 ---
     scheduler = BackgroundScheduler(daemon=True)
-    plant_friendly_names = ["Plant1", "Plant2", "Plant3"] # 테스트를 위한 임시 이름
-
-    for p_name in plant_friendly_names:
-        scheduler.add_job(func=check_and_apply_auto_control, trigger='interval', seconds=60, args=[p_name], id=f'auto_control_job_{p_name}')
-        print(f"Scheduled auto control job for {p_name} every 60 seconds.")
     
+    # 등록된 장치(DB)를 기준으로 스케줄러 등록 필요
+    # 더미 MAC 주소 사용
+    plant_mac_addresses = ["AA:BB:CC:DD:EE:F1", "AA:BB:CC:DD:EE:F2", "AA:BB:CC:DD:EE:F3"]
+
+    for mac_addr in plant_mac_addresses:
+        # 1. 자동 제어 작업 추가
+        friendly_name = f"Plant{mac_addr[-1]}"
+        scheduler.add_job(func=check_and_apply_auto_control, trigger='interval', seconds=60, args=[mac_addr], id=f'auto_control_job_{mac_addr}')
+        print(f"Scheduled auto control job for {friendly_name} ({mac_addr}) every 60 seconds.")
+        
+        # 2. WebSocket으로 실시간 데이터 전송 작업 추가 (매 5초마다)
+        scheduler.add_job(func=send_realtime_data_to_clients, trigger='interval', seconds=5, args=[mac_addr], id=f'realtime_data_job_{mac_addr}')
+        print(f"Scheduled realtime data push for {friendly_name} ({mac_addr}) every 5 seconds.")
+
+    # 3. 월별 보고서 발송 작업 추가
     scheduler.add_job(func=send_monthly_reports_for_users, trigger='cron', hour='0', minute='5', id='monthly_report_job', timezone='Asia/Seoul')
     print("Scheduled monthly report job to run daily at 00:05 (for testing).")
     
@@ -93,7 +123,7 @@ with app.app_context():
     print("APScheduler started for auto control and report tasks.")
 
 
-# --- 기본 라우트 (API 엔드포인트) 정의 ---
+# --- API 엔드포인트 정의 ---
 
 @app.route('/')
 def home():
@@ -187,6 +217,7 @@ def get_image(plant_friendly_name, filename):
         
     safe_filename = secure_filename(filename)
     
+    # 이미지 파일이 저장된 폴더 경로 (app.py 상단에 정의되어 있음)
     filepath_to_serve = os.path.join(IMAGE_UPLOAD_FOLDER, safe_filename)
 
     if os.path.exists(filepath_to_serve) and \
@@ -266,4 +297,4 @@ def register_device():
 if __name__ == '__main__':
     app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'super_secret_key_for_dev')
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
