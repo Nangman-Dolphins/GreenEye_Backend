@@ -6,6 +6,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 import redis
 from datetime import datetime
 import base64
+import uuid
 from werkzeug.utils import secure_filename
 
 # database.py에서 필요한 함수 임포트 (SQLite에 이미지 메타데이터 저장용)
