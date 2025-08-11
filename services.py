@@ -1,3 +1,5 @@
+# greeneye_backend/services.py
+
 import os
 import json
 import paho.mqtt.client as mqtt
@@ -44,7 +46,6 @@ def on_connect(client, userdata, flags, rc):
     """MQTT 브로커 연결 성공 시 호출되는 콜백 함수"""
     if rc == 0:
         print(f"MQTT Broker Connected successfully")
-        # [변경] 데이터 수신 토픽만 구독
         client.subscribe("GreenEye/data/#")
         print("Subscribed to MQTT topic 'GreenEye/data/#'")
     else:
@@ -53,7 +54,6 @@ def on_connect(client, userdata, flags, rc):
 def on_message(client, userdata, msg):
     """MQTT 메시지 수신 시 호출되는 콜백 함수"""
     print(f"MQTT Message received: Topic - {msg.topic}")
-    # [변경] GreenEye/data/ 토픽의 메시지만 처리
     if msg.topic.startswith("GreenEye/data/"):
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
@@ -137,15 +137,11 @@ def get_redis_data(key):
 
 # --- 데이터 처리 메인 로직 ---
 def process_incoming_data(topic, payload):
-    """
-    [신규] MQTT로 수신된 통합 데이터(센서+이미지)를 처리하는 함수
-    """
+    """MQTT로 수신된 통합 데이터(센서+이미지)를 처리하는 함수"""
     try:
-        # 'GreenEye/data/{Device_ID}'에서 Device_ID 추출
         mac_address = topic.split('/')[-1]
         print(f"Processing data for device: {mac_address}")
 
-        # 1. 센서 데이터 처리 (매뉴얼 기반 Key 사용)
         tags = {"mac_address": mac_address}
         fields = {
             "battery": payload.get("bat_level"),
@@ -163,7 +159,6 @@ def process_incoming_data(topic, payload):
             set_redis_data(f"latest_sensor_data:{mac_address}", {"timestamp": datetime.utcnow().isoformat(), **valid_fields})
             print(f"Sensor data processed and stored for {mac_address}")
 
-        # 2. 이미지 데이터 처리 (HEX → JPG)
         image_hex = payload.get("plant_img")
         if image_hex:
             image_bytes = bytes.fromhex(image_hex)
@@ -193,18 +188,14 @@ def process_incoming_data(topic, payload):
 
 # --- 데이터 발행 함수 ---
 def request_data_from_device(mac_address):
-    """
-    [신규] 특정 장치에 데이터 전송을 요청합니다.
-    """
+    """특정 장치에 데이터 전송을 요청합니다."""
     topic = f"GreenEye/req/{mac_address}"
     payload = json.dumps({"req": 0})
     mqtt_client.publish(topic, payload)
     print(f"Sent data request to topic: {topic}")
 
 def send_config_to_device(mac_address, config_payload):
-    """
-    [신규] 특정 장치에 설정 변경 명령을 보냅니다. (플래시, 액추에이터 제어 등)
-    """
+    """특정 장치에 설정 변경 명령을 보냅니다."""
     topic = f"GreenEye/conf/{mac_address}"
     payload = json.dumps(config_payload)
     mqtt_client.publish(topic, payload)
@@ -212,7 +203,7 @@ def send_config_to_device(mac_address, config_payload):
 
 # --- 서비스 초기화 ---
 def initialize_services():
-    """모든 외부 서비스(MQTT, InfluxDB, Redis) 연결을 초기화합니다."""
+    """모든 외부 서비스 연결을 초기화합니다."""
     print("\n--- Initializing Backend Services ---")
     connect_mqtt()
     connect_influxdb()

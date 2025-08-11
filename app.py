@@ -9,15 +9,15 @@ from flask_socketio import SocketIO
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from werkzeug.utils import secure_filename
-import jwt # PyJWT 라이브러리
+import jwt
 
 # 내부 모듈 임포트
 from services import (
     initialize_services, 
     get_redis_data, 
     query_influxdb_data,
-    request_data_from_device, # [변경]
-    send_config_to_device     # [추가]
+    request_data_from_device,
+    send_config_to_device
 )
 from database import (
     init_db, 
@@ -32,7 +32,6 @@ from control_logic import check_and_apply_auto_control
 from report_generator import send_monthly_reports_for_users
 from ai_inference import load_ai_model
 
-# .env 파일에서 환경 변수 로드
 load_dotenv()
 
 app = Flask(__name__)
@@ -45,7 +44,6 @@ INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET')
 
 # --- 실시간 데이터 전송 ---
 def send_realtime_data_to_clients(mac_address):
-    """Redis에서 최신 데이터를 가져와 모든 WebSocket 클라이언트에게 브로드캐스트합니다."""
     latest_data = get_redis_data(f"latest_sensor_data:{mac_address}")
     latest_image_info = get_redis_data(f"latest_image:{mac_address}")
     latest_ai_diagnosis = get_redis_data(f"latest_ai_diagnosis:{mac_address}")
@@ -61,22 +59,15 @@ def send_realtime_data_to_clients(mac_address):
 
 # --- 스케줄러 설정 ---
 def scheduled_data_request_job():
-    """
-    [신규] 등록된 모든 장치에 데이터 요청을 보내는 주기적인 작업
-    """
     print(f"\n--- [{datetime.now()}] Running scheduled data request job ---")
     devices = get_all_devices()
     if not devices:
         print("No devices registered, skipping data request.")
         return
-        
     for device in devices:
         request_data_from_device(device['mac_address'])
 
 def scheduled_auto_control_job():
-    """
-    [신규] 등록된 모든 장치의 자동 제어 로직을 실행하는 작업
-    """
     print(f"\n--- [{datetime.now()}] Running scheduled auto-control job ---")
     devices = get_all_devices()
     if not devices: return
@@ -90,14 +81,10 @@ with app.app_context():
     init_db()
     
     scheduler = BackgroundScheduler(daemon=True, timezone='Asia/Seoul')
-    # 1분마다 데이터 요청
     scheduler.add_job(func=scheduled_data_request_job, trigger='interval', minutes=1, id='data_request_job')
-    # 1분마다 자동 제어 로직 실행
     scheduler.add_job(func=scheduled_auto_control_job, trigger='interval', minutes=1, id='auto_control_job')
-    # 매일 자정 월간 리포트
     scheduler.add_job(func=send_monthly_reports_for_users, trigger='cron', hour='0', minute='5', id='monthly_report_job')
 
-    # 5초마다 실시간 데이터 클라이언트에 전송 (등록된 장치가 있을 경우에만)
     devices = get_all_devices()
     for device in devices:
         scheduler.add_job(func=send_realtime_data_to_clients, trigger='interval', seconds=5, args=[device['mac_address']], id=f'realtime_data_job_{device["mac_address"]}')
@@ -126,8 +113,7 @@ def api_get_latest_sensor_data(plant_friendly_name):
 @app.route('/api/historical_sensor_data/<plant_friendly_name>')
 def get_historical_sensor_data(plant_friendly_name):
     device = get_device_by_friendly_name(plant_friendly_name)
-    if not device:
-        return jsonify({"error": "Device not found with this friendly name"}), 404
+    if not device: return jsonify({"error": "Device not found"}), 404
         
     query = f'''
     from(bucket: "{INFLUXDB_BUCKET}")
@@ -139,37 +125,26 @@ def get_historical_sensor_data(plant_friendly_name):
       |> yield(name: "mean")
     '''
     data = query_influxdb_data(query)
-    
-    formatted_data = []
-    for record in data:
-        record['plant_friendly_name'] = plant_friendly_name
-        formatted_data.append(record)
-    return jsonify(formatted_data)
+    return jsonify(data)
 
 @app.route('/api/device_config/<plant_friendly_name>', methods=['POST'])
 def configure_device(plant_friendly_name):
-    """
-    [신규/통합] 장치 설정 및 제어 명령 전송 API
-    """
     device = get_device_by_friendly_name(plant_friendly_name)
     if not device: return jsonify({"error": "Device not found"}), 404
         
     config_data = request.get_json()
     if not config_data: return jsonify({"error": "Request body must be JSON"}), 400
     
-    # 예시: {"flash_level": 128} 또는 {"device":"pump", "action":"ON"}
     send_config_to_device(device['mac_address'], config_data)
     return jsonify({"status": "success", "message": f"Configuration sent to {plant_friendly_name}"}), 200
 
 @app.route('/api/images/<filename>')
 def get_image(filename):
-    """이미지 파일 서빙 API"""
     safe_filename = secure_filename(filename)
     return send_from_directory(IMAGE_UPLOAD_FOLDER, safe_filename)
 
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
-    """사용자 회원가입 API"""
     if not request.is_json: return jsonify({"error": "Request must be JSON"}), 400
     data = request.get_json()
     email = data.get('email')
@@ -182,7 +157,6 @@ def register_user():
 
 @app.route('/api/auth/login', methods=['POST'])
 def login_user():
-    """사용자 로그인 API"""
     if not request.is_json: return jsonify({"error": "Request must be JSON"}), 400
     data = request.get_json()
     email = data.get('email')
@@ -200,7 +174,6 @@ def login_user():
 
 @app.route('/api/register_device', methods=['POST'])
 def register_device():
-    """새로운 장치를 등록하는 API"""
     if not request.is_json: return jsonify({"error": "Request must be JSON"}), 400
     data = request.get_json()
     mac_address = data.get('mac_address')
@@ -213,5 +186,4 @@ def register_device():
 
 # --- 앱 실행 부분 ---
 if __name__ == '__main__':
-    # 개발 환경에서 직접 실행 시 사용
     socketio.run(app, debug=True, host='0.0.0.0', port=5000)
