@@ -5,20 +5,18 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 import redis
 from datetime import datetime
-import base64
 import uuid
 from werkzeug.utils import secure_filename
 
-# database.py에서 필요한 함수 임포트 (SQLite에 이미지 메타데이터 저장용)
+# 다른 모듈에서 필요한 함수 임포트
 from database import get_db_connection
-# ai_inference.py에서 필요한 함수 임포트 (AI 추론 로직)
 from ai_inference import run_inference_on_image
 
-# .env 파일에서 환경 변수 로드
+# .env 파일 로드
 from dotenv import load_dotenv
 load_dotenv()
 
-# --- 환경 변수 가져오기 ---
+# --- 환경 변수 ---
 MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST')
 MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT'))
 MQTT_USERNAME = os.getenv('MQTT_USERNAME')
@@ -33,68 +31,50 @@ REDIS_HOST = os.getenv('REDIS_HOST')
 REDIS_PORT = int(os.getenv('REDIS_PORT'))
 REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
 
-# 이미지 저장 폴더 (app.py와 동일한 경로)
 IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'images')
 
-# --- MQTT 클라이언트 설정 ---
+# --- 클라이언트 초기화 ---
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+influxdb_client = None
+influxdb_write_api = None
+redis_client = None
 
+# --- MQTT 클라이언트 콜백 및 연결 ---
 def on_connect(client, userdata, flags, rc):
+    """MQTT 브로커 연결 성공 시 호출되는 콜백 함수"""
     if rc == 0:
-        print(f"MQTT Broker Connected successfully with result code {rc}")
-        # 연결 성공 시 토픽 구독
-        client.subscribe("sensor/data/#")
-        client.subscribe("image/data/#")
-        print("Subscribed to MQTT topics 'sensor/data/#' and 'image/data/#'")
+        print(f"MQTT Broker Connected successfully")
+        # [변경] 데이터 수신 토픽만 구독
+        client.subscribe("GreenEye/data/#")
+        print("Subscribed to MQTT topic 'GreenEye/data/#'")
     else:
-        print(f"Failed to connect, return code {rc}\n")
+        print(f"Failed to connect to MQTT broker, return code {rc}\n")
 
 def on_message(client, userdata, msg):
-    print(f"MQTT Message received: Topic - {msg.topic}, Payload length - {len(msg.payload)}")
-    
-    if msg.topic.startswith("sensor/data/"):
+    """MQTT 메시지 수신 시 호출되는 콜백 함수"""
+    print(f"MQTT Message received: Topic - {msg.topic}")
+    # [변경] GreenEye/data/ 토픽의 메시지만 처리
+    if msg.topic.startswith("GreenEye/data/"):
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
-            process_sensor_data(msg.topic, payload)
-        except json.JSONDecodeError:
-            print(f"Error decoding JSON from MQTT payload (sensor): {msg.payload.decode()}")
+            process_incoming_data(msg.topic, payload)
         except Exception as e:
-            print(f"Error processing MQTT sensor message: {e}")
-    elif msg.topic.startswith("image/data/"):
-        try:
-            payload = json.loads(msg.payload.decode('utf-8'))
-            process_image_data(msg.topic, payload)
-        except json.JSONDecodeError:
-            print(f"Error decoding JSON from MQTT payload (image): {msg.payload.decode()}")
-        except Exception as e:
-            print(f"Error processing MQTT image message: {e}")
-    else:
-        print(f"Unhandled MQTT topic: {msg.topic}")
+            print(f"Error processing incoming data: {e}")
 
 def connect_mqtt():
+    """MQTT 브로커에 연결을 시도하는 함수"""
     mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
     try:
         mqtt_client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60)
         mqtt_client.loop_start()
-        print(f"Attempting to connect to MQTT broker at {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
     except Exception as e:
         print(f"Could not connect to MQTT broker: {e}")
 
-def publish_mqtt_message(topic, message):
-    try:
-        mqtt_client.publish(topic, message)
-        print(f"Published MQTT message to topic '{topic}': {message}")
-    except Exception as e:
-        print(f"Error publishing MQTT message: {e}")
-
-
-# --- InfluxDB 클라이언트 설정 ---
-influxdb_client = None
-influxdb_write_api = None
-
+# --- InfluxDB 및 Redis 연결/헬퍼 함수 ---
 def connect_influxdb():
+    """InfluxDB에 연결하는 함수"""
     global influxdb_client, influxdb_write_api
     try:
         influxdb_client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
@@ -103,47 +83,8 @@ def connect_influxdb():
     except Exception as e:
         print(f"Could not connect to InfluxDB: {e}")
 
-def write_sensor_data_to_influxdb(measurement, tags, fields):
-    if not influxdb_write_api:
-        print("InfluxDB write API not initialized.")
-        return
-
-    point = Point(measurement)
-    for tag_key, tag_value in tags.items():
-        point.tag(tag_key, tag_value)
-    for field_key, field_value in fields.items():
-        point.field(field_key, field_value)
-    point.time(datetime.utcnow())
-
-    try:
-        influxdb_write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
-        print(f"Successfully wrote data to InfluxDB: {point.to_line_protocol()}")
-    except Exception as e:
-        print(f"Error writing data to InfluxDB: {e}")
-
-def query_influxdb_data(query):
-    if not influxdb_client:
-        print("InfluxDB client not initialized.")
-        return []
-
-    try:
-        query_api = influxdb_client.query_api()
-        tables = query_api.query(query, org=INFLUXDB_ORG)
-        results = []
-        for table in tables:
-            for record in table.records:
-                results.append(record.values)
-        print(f"Successfully queried data from InfluxDB. Rows: {len(results)}")
-        return results
-    except Exception as e:
-        print(f"Error querying data from InfluxDB: {e}")
-        return []
-
-
-# --- Redis 클라이언트 설정 ---
-redis_client = None
-
 def connect_redis():
+    """Redis에 연결하는 함수"""
     global redis_client
     try:
         redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
@@ -152,128 +93,126 @@ def connect_redis():
     except Exception as e:
         print(f"Could not connect to Redis: {e}")
 
+def write_sensor_data_to_influxdb(measurement, tags, fields):
+    """센서 데이터를 InfluxDB에 쓰는 함수"""
+    if not influxdb_write_api: return
+    point = Point(measurement)
+    for tag_key, tag_value in tags.items(): point.tag(tag_key, tag_value)
+    for field_key, field_value in fields.items(): point.field(field_key, field_value)
+    point.time(datetime.utcnow())
+    try:
+        influxdb_write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+    except Exception as e:
+        print(f"Error writing to InfluxDB: {e}")
+
+def query_influxdb_data(query):
+    """InfluxDB에서 데이터를 조회하는 함수"""
+    if not influxdb_client: return []
+    try:
+        query_api = influxdb_client.query_api()
+        tables = query_api.query(query, org=INFLUXDB_ORG)
+        results = [record.values for table in tables for record in table.records]
+        return results
+    except Exception as e:
+        print(f"Error querying data from InfluxDB: {e}")
+        return []
+
 def set_redis_data(key, value):
-    if not redis_client:
-        print("Redis client not initialized.")
-        return
+    """Redis에 데이터를 쓰는 함수"""
+    if not redis_client: return
     try:
         redis_client.set(key, json.dumps(value))
-        print(f"Successfully set data in Redis: Key - {key}")
     except Exception as e:
         print(f"Error setting data in Redis: {e}")
 
 def get_redis_data(key):
-    if not redis_client:
-        print("Redis client not initialized.")
-        return None
+    """Redis에서 데이터를 읽는 함수"""
+    if not redis_client: return None
     try:
         data = redis_client.get(key)
-        if data:
-            return json.loads(data)
-        return None
+        return json.loads(data) if data else None
     except Exception as e:
         print(f"Error getting data from Redis: {e}")
         return None
 
-
-# --- 센서 데이터 처리 로직 ---
-def process_sensor_data(topic, payload):
+# --- 데이터 처리 메인 로직 ---
+def process_incoming_data(topic, payload):
+    """
+    [신규] MQTT로 수신된 통합 데이터(센서+이미지)를 처리하는 함수
+    """
     try:
-        topic_parts = topic.split('/')
-        if len(topic_parts) >= 3 and topic_parts[0] == "sensor" and topic_parts[1] == "data":
-            mac_address = topic_parts[2]
-        else:
-            print(f"Invalid MQTT topic format for sensor data: {topic}")
-            return
+        # 'GreenEye/data/{Device_ID}'에서 Device_ID 추출
+        mac_address = topic.split('/')[-1]
+        print(f"Processing data for device: {mac_address}")
 
+        # 1. 센서 데이터 처리 (매뉴얼 기반 Key 사용)
         tags = {"mac_address": mac_address}
         fields = {
-            "temperature": payload.get("temperature"),
-            "humidity": payload.get("humidity"),
-            "light_lux": payload.get("light_lux"),
-            "soil_moisture": payload.get("soil_moisture"),
+            "battery": payload.get("bat_level"),
+            "temperature": payload.get("amb_temp"),
+            "humidity": payload.get("amb_humi"),
+            "light_lux": payload.get("amb_light"),
+            "soil_temp": payload.get("soil_temp"),
+            "soil_moisture": payload.get("soil_humi"),
             "soil_ec": payload.get("soil_ec")
         }
-        for key, value in fields.items():
-            if value == 9999:
-                fields[key] = None
-        
-        fields = {k: v for k, v in fields.items() if v is not None}
+        valid_fields = {k: v for k, v in fields.items() if v is not None}
 
-        if fields:
-            write_sensor_data_to_influxdb("sensor_readings", tags, fields)
-            latest_data = {
-                "timestamp": datetime.utcnow().isoformat(),
-                "mac_address": mac_address,
-                **fields
-            }
-            set_redis_data(f"latest_sensor_data:{mac_address}", latest_data)
-        else:
-            print(f"No valid sensor fields found in payload for {mac_address}. Payload: {payload}")
+        if valid_fields:
+            write_sensor_data_to_influxdb("sensor_readings", tags, valid_fields)
+            set_redis_data(f"latest_sensor_data:{mac_address}", {"timestamp": datetime.utcnow().isoformat(), **valid_fields})
+            print(f"Sensor data processed and stored for {mac_address}")
 
-    except Exception as e:
-        print(f"Error in process_sensor_data for topic {topic}: {e}")
+        # 2. 이미지 데이터 처리 (HEX → JPG)
+        image_hex = payload.get("plant_img")
+        if image_hex:
+            image_bytes = bytes.fromhex(image_hex)
+            unique_filename = f"{secure_filename(mac_address)}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+            filepath = os.path.join(IMAGE_UPLOAD_FOLDER, unique_filename)
+            os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
+            
+            with open(filepath, "wb") as f:
+                f.write(image_bytes)
+            
+            conn = get_db_connection()
+            conn.execute(
+                "INSERT INTO plant_images (mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?)",
+                (mac_address, unique_filename, filepath, datetime.utcnow().isoformat())
+            )
+            conn.commit()
+            conn.close()
+            set_redis_data(f"latest_image:{mac_address}", {"filename": unique_filename})
+            print(f"Image saved: {filepath}")
 
-# --- 이미지 데이터 처리 로직 ---
-def process_image_data(topic, payload):
-    try:
-        topic_parts = topic.split('/')
-        if len(topic_parts) >= 3 and topic_parts[0] == "image" and topic_parts[1] == "data":
-            mac_address = topic_parts[2]
-        else:
-            print(f"Invalid MQTT topic format for image data: {topic}")
-            return
-
-        image_base64 = payload.get("image_data_base64")
-        timestamp_str = payload.get("timestamp")
-
-        if not image_base64:
-            print(f"No Base64 image data found in payload for {mac_address}.")
-            return
-        
-        image_bytes = base64.b64decode(image_base64)
-        
-        file_extension = "jpg"
-        unique_filename = f"{secure_filename(mac_address)}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{file_extension}"
-        filepath = os.path.join(IMAGE_UPLOAD_FOLDER, unique_filename)
-
-        os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
-        
-        with open(filepath, "wb") as f:
-            f.write(image_bytes)
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS plant_images (id INTEGER PRIMARY KEY AUTOINCREMENT, mac_address TEXT NOT NULL, filename TEXT NOT NULL UNIQUE, filepath TEXT NOT NULL, timestamp TEXT NOT NULL)",
-            ()
-        )
-        cursor.execute(
-            "INSERT INTO plant_images (mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?)",
-            (mac_address, unique_filename, filepath, timestamp_str or datetime.utcnow().isoformat())
-        )
-        conn.commit()
-        conn.close()
-
-        set_redis_data(f"latest_image:{mac_address}", {
-            "filename": unique_filename,
-            "filepath": filepath,
-            "timestamp": timestamp_str or datetime.utcnow().isoformat()
-        })
-        
-        print(f"Image uploaded via MQTT and saved: {filepath}")
-
-        # --- AI 추론 로직 호출 및 결과 저장 ---
-        diagnosis_result = run_inference_on_image(mac_address, filepath)
-        
-        # [수정된 부분] AI가 반환한 상세 결과 객체 전체를 Redis에 저장합니다.
-        set_redis_data(f"latest_ai_diagnosis:{mac_address}", diagnosis_result)
+            diagnosis_result = run_inference_on_image(mac_address, filepath)
+            set_redis_data(f"latest_ai_diagnosis:{mac_address}", diagnosis_result)
+            print(f"AI inference complete for {mac_address}")
 
     except Exception as e:
-        print(f"Error in process_image_data for topic {topic}: {e}")
+        print(f"Error in process_incoming_data for topic {topic}: {e}")
 
-# --- 모든 서비스 연결 초기화 함수 ---
+# --- 데이터 발행 함수 ---
+def request_data_from_device(mac_address):
+    """
+    [신규] 특정 장치에 데이터 전송을 요청합니다.
+    """
+    topic = f"GreenEye/req/{mac_address}"
+    payload = json.dumps({"req": 0})
+    mqtt_client.publish(topic, payload)
+    print(f"Sent data request to topic: {topic}")
+
+def send_config_to_device(mac_address, config_payload):
+    """
+    [신규] 특정 장치에 설정 변경 명령을 보냅니다. (플래시, 액추에이터 제어 등)
+    """
+    topic = f"GreenEye/conf/{mac_address}"
+    payload = json.dumps(config_payload)
+    mqtt_client.publish(topic, payload)
+    print(f"Sent config to topic: {topic} with payload: {payload}")
+
+# --- 서비스 초기화 ---
 def initialize_services():
+    """모든 외부 서비스(MQTT, InfluxDB, Redis) 연결을 초기화합니다."""
     print("\n--- Initializing Backend Services ---")
     connect_mqtt()
     connect_influxdb()
