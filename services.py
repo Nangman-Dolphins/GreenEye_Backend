@@ -11,6 +11,8 @@ from werkzeug.utils import secure_filename
 
 # database.py에서 필요한 함수 임포트 (SQLite에 이미지 메타데이터 저장용)
 from database import get_db_connection
+# ai_inference.py에서 필요한 함수 임포트 (AI 추론 로직)
+from ai_inference import run_inference_on_image # <-- 이 줄 추가
 
 # .env 파일에서 환경 변수 로드
 from dotenv import load_dotenv
@@ -46,7 +48,6 @@ def on_connect(client, userdata, flags, rc):
 def on_message(client, userdata, msg):
     print(f"MQTT Message received: Topic - {msg.topic}, Payload length - {len(msg.payload)}")
     
-    # 토픽에 따라 센서 데이터와 이미지 데이터를 다르게 처리
     if msg.topic.startswith("sensor/data/"):
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
@@ -178,7 +179,6 @@ def process_sensor_data(topic, payload):
     5가지 센서 값(온도, 습도, 조도, 토양 수분, 토양 전도도)을 처리합니다.
     """
     try:
-        # MAC 주소를 토픽에서 추출 (예: "sensor/data/AA:BB:CC:DD:EE:FF")
         topic_parts = topic.split('/')
         if len(topic_parts) >= 3 and topic_parts[0] == "sensor" and topic_parts[1] == "data":
             mac_address = topic_parts[2]
@@ -186,30 +186,24 @@ def process_sensor_data(topic, payload):
             print(f"Invalid MQTT topic format for sensor data: {topic}")
             return
 
-        # InfluxDB에 저장할 데이터 준비
-        # measurement: 'sensor_readings' (측정값의 종류)
-        # tags: 어떤 단말기에서 온 데이터인지 식별 (mac_address)
-        # fields: 실제 센서 값들
         tags = {"mac_address": mac_address}
         fields = {
-            "temperature": payload.get("temperature"),     # 온도
-            "humidity": payload.get("humidity"),           # 습도
-            "light_lux": payload.get("light_lux"),         # 조도 (lux)
-            "soil_moisture": payload.get("soil_moisture"), # 토양 수분
-            "soil_ec": payload.get("soil_ec")              # 토양 전도도 (EC)
+            "temperature": payload.get("temperature"),
+            "humidity": payload.get("humidity"),
+            "light_lux": payload.get("light_lux"),
+            "soil_moisture": payload.get("soil_moisture"),
+            "soil_ec": payload.get("soil_ec")
         }
-        # 9999 값을 None으로 처리 (InfluxDB에 저장되지 않도록)
         for key, value in fields.items():
-            if value == 9999: # 9999로 전송된 오류값 처리
+            if value == 9999:
                 fields[key] = None
         
-        # None 값 필터링: InfluxDB는 None 값을 저장하지 않으므로 유효한 필드만 남김
         fields = {k: v for k, v in fields.items() if v is not None}
 
         if fields:
             write_sensor_data_to_influxdb("sensor_readings", tags, fields)
             latest_data = {
-                "timestamp": datetime.utcnow().isoformat(), # ISO 형식 UTC 시간
+                "timestamp": datetime.utcnow().isoformat(),
                 "mac_address": mac_address,
                 **fields
             }
@@ -226,7 +220,6 @@ def process_image_data(topic, payload):
     MQTT로 수신된 이미지 데이터를 Base64 디코딩하여 로컬에 저장하고 SQLite에 메타데이터를 저장합니다.
     """
     try:
-        # MAC 주소를 토픽에서 추출 (예: "image/data/AA:BB:CC:DD:EE:FF")
         topic_parts = topic.split('/')
         if len(topic_parts) >= 3 and topic_parts[0] == "image" and topic_parts[1] == "data":
             mac_address = topic_parts[2]
@@ -241,22 +234,17 @@ def process_image_data(topic, payload):
             print(f"No Base64 image data found in payload for {mac_address}.")
             return
         
-        # Base64 디코딩
         image_bytes = base64.b64decode(image_base64)
         
-        # 안전한 파일 이름 생성 (MAC 주소 + 타임스탬프 + UUID)
-        file_extension = "jpg" # 단말기에서 JPEG로 보낼 것 가정
+        file_extension = "jpg"
         unique_filename = f"{secure_filename(mac_address)}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{file_extension}"
         filepath = os.path.join(IMAGE_UPLOAD_FOLDER, unique_filename)
 
-        # 이미지 폴더가 없으면 생성
         os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
         
-        # 이미지 파일 로컬에 저장
         with open(filepath, "wb") as f:
             f.write(image_bytes)
         
-        # SQLite에 이미지 메타데이터 저장
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -270,19 +258,20 @@ def process_image_data(topic, payload):
         conn.commit()
         conn.close()
 
-        # Redis에 최신 이미지 경로 캐싱 (AI 진단 결과와 함께 사용될 수 있음)
         set_redis_data(f"latest_image:{mac_address}", {
             "filename": unique_filename,
             "filepath": filepath,
             "timestamp": timestamp_str or datetime.utcnow().isoformat()
         })
-
+        
         print(f"Image uploaded via MQTT and saved: {filepath}")
 
-        # 이 시점에서 AI 추론 로직을 호출 (나중에 추가)
-        # from ai_inference import run_inference_on_image
-        # diagnosis_result = run_inference_on_image(filepath)
-        # set_redis_data(f"latest_ai_diagnosis:{mac_address}", {"diagnosis": diagnosis_result, "timestamp": datetime.utcnow().isoformat()})
+        # --- AI 추론 로직 호출 부분 ---
+        # 이미지 저장이 완료된 후에 AI 추론 함수를 호출합니다.
+        from ai_inference import run_inference_on_image
+        diagnosis_result = run_inference_on_image(mac_address, filepath)
+        # AI 진단 결과를 Redis에 캐싱
+        set_redis_data(f"latest_ai_diagnosis:{mac_address}", {"diagnosis": diagnosis_result, "timestamp": datetime.utcnow().isoformat()})
 
     except Exception as e:
         print(f"Error in process_image_data for topic {topic}: {e}")
