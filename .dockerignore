@@ -1,0 +1,20 @@
+# Python 가상 환경 폴더
+venv/
+.venv/
+
+# Python 캐시 파일
+__pycache__/
+*.pyc
+*.pyo
+
+# Docker 관련 설정 파일
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Git 관련 폴더
+.git
+.gitignore
+
+# 로컬 환경 변수 파일
+.env

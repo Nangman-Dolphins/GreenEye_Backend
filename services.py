@@ -12,7 +12,7 @@ from werkzeug.utils import secure_filename
 # database.py에서 필요한 함수 임포트 (SQLite에 이미지 메타데이터 저장용)
 from database import get_db_connection
 # ai_inference.py에서 필요한 함수 임포트 (AI 추론 로직)
-from ai_inference import run_inference_on_image # <-- 이 줄 추가
+from ai_inference import run_inference_on_image
 
 # .env 파일에서 환경 변수 로드
 from dotenv import load_dotenv
@@ -42,6 +42,10 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print(f"MQTT Broker Connected successfully with result code {rc}")
+        # 연결 성공 시 토픽 구독
+        client.subscribe("sensor/data/#")
+        client.subscribe("image/data/#")
+        print("Subscribed to MQTT topics 'sensor/data/#' and 'image/data/#'")
     else:
         print(f"Failed to connect, return code {rc}\n")
 
@@ -174,10 +178,6 @@ def get_redis_data(key):
 
 # --- 센서 데이터 처리 로직 ---
 def process_sensor_data(topic, payload):
-    """
-    MQTT로 수신된 센서 데이터를 InfluxDB에 저장하고 Redis에 캐시하는 함수.
-    5가지 센서 값(온도, 습도, 조도, 토양 수분, 토양 전도도)을 처리합니다.
-    """
     try:
         topic_parts = topic.split('/')
         if len(topic_parts) >= 3 and topic_parts[0] == "sensor" and topic_parts[1] == "data":
@@ -216,9 +216,6 @@ def process_sensor_data(topic, payload):
 
 # --- 이미지 데이터 처리 로직 ---
 def process_image_data(topic, payload):
-    """
-    MQTT로 수신된 이미지 데이터를 Base64 디코딩하여 로컬에 저장하고 SQLite에 메타데이터를 저장합니다.
-    """
     try:
         topic_parts = topic.split('/')
         if len(topic_parts) >= 3 and topic_parts[0] == "image" and topic_parts[1] == "data":
@@ -266,12 +263,11 @@ def process_image_data(topic, payload):
         
         print(f"Image uploaded via MQTT and saved: {filepath}")
 
-        # --- AI 추론 로직 호출 부분 ---
-        # 이미지 저장이 완료된 후에 AI 추론 함수를 호출합니다.
-        from ai_inference import run_inference_on_image
+        # --- AI 추론 로직 호출 및 결과 저장 ---
         diagnosis_result = run_inference_on_image(mac_address, filepath)
-        # AI 진단 결과를 Redis에 캐싱
-        set_redis_data(f"latest_ai_diagnosis:{mac_address}", {"diagnosis": diagnosis_result, "timestamp": datetime.utcnow().isoformat()})
+        
+        # [수정된 부분] AI가 반환한 상세 결과 객체 전체를 Redis에 저장합니다.
+        set_redis_data(f"latest_ai_diagnosis:{mac_address}", diagnosis_result)
 
     except Exception as e:
         print(f"Error in process_image_data for topic {topic}: {e}")
@@ -282,4 +278,4 @@ def initialize_services():
     connect_mqtt()
     connect_influxdb()
     connect_redis()
-    print("--- All backend services initialized. ---\n")
+    print("--- All services connection attempts made. ---\n")
