@@ -1,5 +1,3 @@
-# greeneye_backend/app.py
-
 import os
 import json
 import pytz
@@ -44,6 +42,7 @@ INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET')
 
 # --- 실시간 데이터 전송 ---
 def send_realtime_data_to_clients(mac_address):
+    """Redis에서 최신 데이터를 가져와 모든 WebSocket 클라이언트에게 브로드캐스트합니다."""
     latest_data = get_redis_data(f"latest_sensor_data:{mac_address}")
     latest_image_info = get_redis_data(f"latest_image:{mac_address}")
     latest_ai_diagnosis = get_redis_data(f"latest_ai_diagnosis:{mac_address}")
@@ -59,6 +58,7 @@ def send_realtime_data_to_clients(mac_address):
 
 # --- 스케줄러 설정 ---
 def scheduled_data_request_job():
+    """등록된 모든 장치에 데이터 요청을 보내는 주기적인 작업"""
     print(f"\n--- [{datetime.now()}] Running scheduled data request job ---")
     devices = get_all_devices()
     if not devices:
@@ -68,6 +68,7 @@ def scheduled_data_request_job():
         request_data_from_device(device['mac_address'])
 
 def scheduled_auto_control_job():
+    """등록된 모든 장치의 자동 제어 로직을 실행하는 작업"""
     print(f"\n--- [{datetime.now()}] Running scheduled auto-control job ---")
     devices = get_all_devices()
     if not devices: return
@@ -129,6 +130,7 @@ def get_historical_sensor_data(plant_friendly_name):
 
 @app.route('/api/device_config/<plant_friendly_name>', methods=['POST'])
 def configure_device(plant_friendly_name):
+    """[신규/통합] 장치 설정 및 제어 명령 전송 API"""
     device = get_device_by_friendly_name(plant_friendly_name)
     if not device: return jsonify({"error": "Device not found"}), 404
         
@@ -140,11 +142,13 @@ def configure_device(plant_friendly_name):
 
 @app.route('/api/images/<filename>')
 def get_image(filename):
+    """이미지 파일 서빙 API"""
     safe_filename = secure_filename(filename)
     return send_from_directory(IMAGE_UPLOAD_FOLDER, safe_filename)
 
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
+    """사용자 회원가입 API"""
     if not request.is_json: return jsonify({"error": "Request must be JSON"}), 400
     data = request.get_json()
     email = data.get('email')
@@ -157,6 +161,7 @@ def register_user():
 
 @app.route('/api/auth/login', methods=['POST'])
 def login_user():
+    """사용자 로그인 API"""
     if not request.is_json: return jsonify({"error": "Request must be JSON"}), 400
     data = request.get_json()
     email = data.get('email')
@@ -174,6 +179,7 @@ def login_user():
 
 @app.route('/api/register_device', methods=['POST'])
 def register_device():
+    """새로운 장치를 등록하는 API"""
     if not request.is_json: return jsonify({"error": "Request must be JSON"}), 400
     data = request.get_json()
     mac_address = data.get('mac_address')

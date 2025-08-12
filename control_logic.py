@@ -1,5 +1,3 @@
-# greeneye_backend/control_logic.py
-
 import json
 from datetime import datetime
 import pytz
