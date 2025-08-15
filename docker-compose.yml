@@ -42,10 +42,11 @@ services:
       greeneye_backend_app:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost/ || exit 1"]
-      interval: 30s
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 15s
 
   # 3. Mosquitto MQTT
   mosquitto:

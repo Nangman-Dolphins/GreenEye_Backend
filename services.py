@@ -200,6 +200,37 @@ def send_config_to_device(device_id: str, config_payload: dict):
             f"actuator_state:{device_id}:flash",
             {"ts": datetime.utcnow().isoformat(), **to_send},
         )
+        
+# --- MQTT 퍼블리시(앱에서 기대하는 공개 API) ---
+def publish_mqtt_message(topic: str, payload, qos: int = 0, retain: bool = False) -> bool:
+    """
+    앱(app.py)이 import 해서 쓰는 표준 퍼블리시 함수.
+    payload가 dict/list면 JSON 문자열로 변환해서 전송.
+    MQTT 연결이 안 되어 있으면 자동으로 연결 시도.
+    """
+    try:
+        # payload를 문자열로 정규화
+        if isinstance(payload, (dict, list)):
+            payload_str = json.dumps(payload, ensure_ascii=False)
+        else:
+            payload_str = str(payload)
+
+        # 필요 시 연결
+        if not mqtt_client.is_connected():
+            connect_mqtt()
+
+        info = mqtt_client.publish(topic, payload_str, qos=qos, retain=retain)
+        try:
+            # 전송 완료까지 최대 5초 대기 (성공 시 True)
+            info.wait_for_publish(timeout=5)
+        except TypeError:
+            # 일부 버전에선 timeout 파라미터가 없을 수 있음
+            info.wait_for_publish()
+
+        return getattr(info, "rc", 0) == 0
+    except Exception as e:
+        print(f"Error publishing MQTT message to {topic}: {e}")
+        return False
 
 # --- 헬스체크용 ---
 def is_connected_mqtt():

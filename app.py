@@ -43,6 +43,38 @@ from report_generator import send_monthly_reports_for_users, generate_monthly_re
 
 load_dotenv()
 app = Flask(__name__)
+from functools import wraps
+from threading import Lock
+
+if not hasattr(app, "before_first_request"):
+    _run_once_lock = Lock()
+    _run_once_flag = {"done": False}
+
+    def _before_first_request_decorator(func):
+        # 등록된 원래 함수는 그대로 반환
+        @wraps(func)
+        def _return_original(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        # 첫 요청 전에 단 한 번만 실행되도록 before_request에 훅을 단다
+        @app.before_request
+        def _run_once_wrapper():
+            if _run_once_flag["done"]:
+                return
+            with _run_once_lock:
+                if _run_once_flag["done"]:
+                    return
+                _run_once_flag["done"] = True
+                try:
+                    func()
+                except Exception as e:
+                    # 초기화 에러가 있으면 로그에 보이도록 raise
+                    raise
+
+        return _return_original
+
+    # Flask가 기대하는 이름을 우리 데코레이터로 대체
+    app.before_first_request = _before_first_request_decorator
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "super_secret_key_for_dev")
