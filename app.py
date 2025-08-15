@@ -45,35 +45,34 @@ load_dotenv()
 app = Flask(__name__)
 from functools import wraps
 from threading import Lock
+from flask import request  # ← 추가
 
 if not hasattr(app, "before_first_request"):
     _run_once_lock = Lock()
     _run_once_flag = {"done": False}
+    _health_skip_paths = {"/healthz", "/health"}  # 필요하면 "/"도 추가 가능
 
     def _before_first_request_decorator(func):
-        # 등록된 원래 함수는 그대로 반환
         @wraps(func)
         def _return_original(*args, **kwargs):
             return func(*args, **kwargs)
 
-        # 첫 요청 전에 단 한 번만 실행되도록 before_request에 훅을 단다
         @app.before_request
         def _run_once_wrapper():
+            # 헬스 체크 경로는 초기화 건너뛰기
+            if request.path in _health_skip_paths:
+                return
+
             if _run_once_flag["done"]:
                 return
             with _run_once_lock:
                 if _run_once_flag["done"]:
                     return
                 _run_once_flag["done"] = True
-                try:
-                    func()
-                except Exception as e:
-                    # 초기화 에러가 있으면 로그에 보이도록 raise
-                    raise
+                func()  # 에러는 그대로 올려서 로그에 보이게
 
         return _return_original
 
-    # Flask가 기대하는 이름을 우리 데코레이터로 대체
     app.before_first_request = _before_first_request_decorator
 socketio = SocketIO(app, cors_allowed_origins="*")
 
@@ -138,6 +137,11 @@ def init_runtime_and_scheduler():
 @app.route("/")
 def home():
     return "Hello, GreenEye Backend is running!"
+
+@app.get("/healthz")
+@app.get("/health")
+def healthz():
+    return {"status": "ok"}, 200
 
 @app.route("/api/status")
 def status():
