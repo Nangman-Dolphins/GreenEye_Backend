@@ -1,21 +1,29 @@
 import os
 import json
+import uuid
 import pytz
-from datetime import datetime
-from flask import Flask, jsonify, request, send_from_directory
-from flask_socketio import SocketIO
-from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
-from werkzeug.utils import secure_filename
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
+import base64
+import requests
 import jwt
 
-# 내부 모듈
+from flask import Flask, jsonify, request, send_from_directory, g
+from flask_socketio import SocketIO, emit
+from dotenv import load_dotenv
+
+from apscheduler.schedulers.background import BackgroundScheduler
+
 from services import (
     initialize_services,
+    mqtt_client,
     get_redis_data,
     query_influxdb_data,
-    request_data_from_device,
+    publish_mqtt_message,
+    set_redis_data,
+    process_incoming_data,
     send_config_to_device,
+    is_connected_influx, is_connected_mqtt, is_connected_redis
 )
 from database import (
     init_db,
@@ -25,144 +33,137 @@ from database import (
     add_device,
     get_device_by_friendly_name,
     get_all_devices,
+    get_device_by_device_id
 )
-from control_logic import check_and_apply_auto_control
-from report_generator import send_monthly_reports_for_users
-from ai_inference import load_ai_model
+from control_logic import (
+    handle_manual_control,
+    check_and_apply_auto_control
+)
+from report_generator import send_monthly_reports_for_users, generate_monthly_report_content_by_device
 
 load_dotenv()
-
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# --- 설정 (보안 강화) ---
-_secret = os.getenv("FLASK_SECRET_KEY")
-if not _secret:
-    raise RuntimeError("FLASK_SECRET_KEY is not set. Set it in .env before running.")
-app.config["SECRET_KEY"] = _secret
+app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "super_secret_key_for_dev")
 
 IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), "images")
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
 
-# --- 실시간 데이터 브로드캐스트 ---
-def send_realtime_data_to_clients(mac_address: str):
-    latest_data = get_redis_data(f"latest_sensor_data:{mac_address}")
-    latest_image_info = get_redis_data(f"latest_image:{mac_address}")
-    latest_ai_diagnosis = get_redis_data(f"latest_ai_diagnosis:{mac_address}")
 
-    if latest_data:
-        if latest_image_info:
-            latest_data["latest_image_filename"] = latest_image_info["filename"]
-        if latest_ai_diagnosis:
-            latest_data["ai_diagnosis"] = latest_ai_diagnosis
-        socketio.emit("realtime_data", latest_data)
-        print(f"[WebSocket] Sent realtime data for {mac_address}.")
+def token_required(f):
+    def decorated(*args, **kwargs):
+        token = request.headers.get("Authorization")
+        if not token or not token.startswith("Bearer "):
+            return jsonify({"message": "Token is missing!"}), 401
+        
+        token = token.split(" ")[1]
+        
+        try:
+            data = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+            g.current_user = get_user_by_email(data["email"])
+        except jwt.PyJWTError as e:
+            return jsonify({"message": "Token is invalid!", "error": str(e)}), 401
 
-# --- 스케줄러 작업 ---
-def scheduled_data_request_job():
-    print(f"\n--- [{datetime.now()}] Running scheduled data request job ---")
-    devices = get_all_devices()
-    if not devices:
-        print("No devices registered, skipping data request.")
-        return
-    for device in devices:
-        request_data_from_device(device["mac_address"])
+        return f(*args, **kwargs)
+    return decorated
 
-def scheduled_auto_control_job():
-    print(f"\n--- [{datetime.now()}] Running scheduled auto-control job ---")
-    devices = get_all_devices()
-    if not devices:
-        return
-    for device in devices:
-        check_and_apply_auto_control(device["mac_address"])
+
+@app.before_first_request
+def before_first_request():
+    with app.app_context():
+        init_runtime_and_scheduler()
 
 def init_runtime_and_scheduler():
-    """
-    서비스/DB/AI 초기화 후 스케줄러 등록.
-    [중복실행방지] Flask debug 리로더 환경에서 2회 실행되지 않도록 가드 처리.
-    """
-    with app.app_context():
-        initialize_services()
-        load_ai_model()
-        init_db()
+    initialize_services()
+    init_db()
+    # load_ai_model() # 모델 준비 시 사용
 
-        scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
-        scheduler.add_job(scheduled_data_request_job, "interval", minutes=1, id="data_request_job", replace_existing=True)
-        scheduler.add_job(scheduled_auto_control_job, "interval", minutes=1, id="auto_control_job", replace_existing=True)
-        scheduler.add_job(send_monthly_reports_for_users, "cron", hour="0", minute="5", id="monthly_report_job", replace_existing=True)
-
-        devices = get_all_devices()
+    scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
+    
+    devices = get_all_devices()
+    
+    if not devices:
+        print("No devices found in DB. Skipping scheduler setup for auto control.")
+    else:
         for device in devices:
-            scheduler.add_job(
-                send_realtime_data_to_clients,
-                "interval",
-                seconds=5,
-                args=[device["mac_address"]],
-                id=f"realtime_data_job_{device['mac_address']}",
-                replace_existing=True,
-            )
+            device_id = device['device_id']
+            friendly_name = device['friendly_name']
 
-        # 디버그 리로더 가드
-        if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.getenv("FLASK_DEBUG", "0") == "0":
-            scheduler.start()
-            print("APScheduler started.")
-        else:
-            print("APScheduler not started due to dev reloader safeguard.")
+            scheduler.add_job(check_and_apply_auto_control, "interval", minutes=1, args=[device_id], id=f"auto_control_job_{device_id}", replace_existing=True)
+            print(f"Scheduled auto control job for {friendly_name} ({device_id}) every 1 minutes.")
+            
+            scheduler.add_job(send_realtime_data_to_clients, "interval", seconds=5, args=[device_id], id=f"realtime_data_job_{device_id}", replace_existing=True)
+            print(f"Scheduled realtime data push for {friendly_name} ({device_id}) every 5 seconds.")
 
-# --- API ---
+    scheduler.add_job(send_monthly_reports_for_users, "cron", day="1", hour="0", minute="5", id="monthly_report_job", replace_existing=True)
+    print("Scheduled monthly report job to run on the 1st of every month at 00:05.")
+    
+    scheduler.start()
+    print("APScheduler started.")
+
+
+@app.route("/")
+def home():
+    return "Hello, GreenEye Backend is running!"
+
 @app.route("/api/status")
 def status():
     return jsonify({"status": "ok", "message": "Backend API is working!"})
 
-@app.route("/api/latest_sensor_data/<plant_friendly_name>")
-def api_get_latest_sensor_data(plant_friendly_name):
-    device = get_device_by_friendly_name(plant_friendly_name)
-    if not device:
+@app.route("/api/health")
+def health():
+    return jsonify({
+        "api": "ok",
+        "mqtt": "ok" if is_connected_mqtt() else "down",
+        "influxdb": "ok" if is_connected_influx() else "down",
+        "redis": "ok" if is_connected_redis() else "down",
+    })
+
+@app.route("/api/latest_sensor_data/<device_id>")
+def get_latest_sensor_data(device_id: str):
+    dev = get_device_by_device_id(device_id)
+    if not dev:
         return jsonify({"error": "Device not found"}), 404
-
-    data = get_redis_data(f"latest_sensor_data:{device['mac_address']}")
-    ai_diagnosis = get_redis_data(f"latest_ai_diagnosis:{device['mac_address']}")
-
+    data = get_redis_data(f"latest_sensor_data:{device_id}")
+    ai_diagnosis = get_redis_data(f"latest_ai_diagnosis:{device_id}")
     if not data:
         return jsonify({"error": "No data found"}), 404
     if ai_diagnosis:
         data["ai_diagnosis"] = ai_diagnosis
+    data["friendly_name"] = dev["friendly_name"]
     return jsonify(data)
 
-@app.route("/api/historical_sensor_data/<plant_friendly_name>")
-def get_historical_sensor_data(plant_friendly_name):
-    device = get_device_by_friendly_name(plant_friendly_name)
-    if not device:
+@app.route("/api/historical_sensor_data/<device_id>")
+def get_historical_sensor_data(device_id: str):
+    dev = get_device_by_device_id(device_id)
+    if not dev:
         return jsonify({"error": "Device not found"}), 404
-
     query = f'''
     from(bucket: "{INFLUXDB_BUCKET}")
       |> range(start: -7d)
       |> filter(fn: (r) => r._measurement == "sensor_readings")
-      |> filter(fn: (r) => r.mac_address == "{device['mac_address']}")
+      |> filter(fn: (r) => r.device_id == "{device_id}")
       |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
-      |> keep(columns: ["_time", "mac_address", "temperature", "humidity", "light_lux", "soil_moisture", "soil_ec"])
+      |> keep(columns: ["_time","device_id","temperature","humidity","light_lux","soil_moisture","soil_ec","soil_temp","battery"])
     '''
     data = query_influxdb_data(query)
+    for row in data:
+        row["friendly_name"] = dev["friendly_name"]
     return jsonify(data)
 
-@app.route("/api/device_config/<plant_friendly_name>", methods=["POST"])
-def configure_device(plant_friendly_name):
-    device = get_device_by_friendly_name(plant_friendly_name)
-    if not device:
+@app.route("/api/control_device/<device_id>", methods=["POST"])
+def control_device(device_id: str):
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    dev = get_device_by_device_id(device_id)
+    if not dev:
         return jsonify({"error": "Device not found"}), 404
-
     config_data = request.get_json()
     if not config_data:
         return jsonify({"error": "Request body must be JSON"}), 400
-
-    send_config_to_device(device["mac_address"], config_data)
-    return jsonify({"status": "success", "message": f"Configuration sent to {plant_friendly_name}"}), 200
-
-@app.route("/api/images/<filename>")
-def get_image(filename):
-    safe_filename = secure_filename(filename)
-    return send_from_directory(IMAGE_UPLOAD_FOLDER, safe_filename)
+    send_config_to_device(device_id, config_data)
+    return jsonify({"status": "success", "message": f"Configuration sent to {device_id}"})
 
 @app.route("/api/auth/register", methods=["POST"])
 def register_user():
@@ -189,11 +190,8 @@ def login_user():
         return jsonify({"error": "Email and password are required"}), 400
     user = get_user_by_email(email)
     if user and check_password(user["password_hash"], password):
-        try:
-            token = jwt.encode({"email": user["email"], "id": user["id"]}, app.config["SECRET_KEY"], algorithm="HS256")
-            return jsonify({"status": "success", "message": "Logged in successfully", "token": token}), 200
-        except Exception as e:
-            return jsonify({"error": f"Failed to create token: {e}"}), 500
+        token = jwt.encode({"email": user["email"], "id": user["id"]}, app.config["SECRET_KEY"], algorithm="HS256")
+        return jsonify({"status": "success", "message": "Logged in successfully", "token": token}), 200
     else:
         return jsonify({"error": "Invalid email or password"}), 401
 
@@ -202,16 +200,26 @@ def register_device():
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
     data = request.get_json()
-    mac_address = data.get("mac_address")
-    plant_friendly_name = data.get("plant_friendly_name")
-    if not mac_address or not plant_friendly_name:
-        return jsonify({"error": "MAC address and plant friendly name are required"}), 400
-    if add_device(mac_address, plant_friendly_name):
-        return jsonify({"status": "success", "message": "Device registered successfully"}), 201
+    mac = data.get("mac_address")
+    friendly_name = data.get("friendly_name")
+    if not mac or not friendly_name:
+        return jsonify({"error": "MAC address and friendly name are required"}), 400
+    
+    device_id = mac.replace(":", "").lower()[-4:]
+    if add_device(mac, friendly_name, device_id):
+        return jsonify({"status": "success", "device_id": device_id, "message": "Device registered successfully"}), 201
     else:
-        return jsonify({"error": "Device with this MAC or name already exists"}), 409
+        return jsonify({"error": "Device already exists"}), 409
 
-# --- 실행 ---
+@app.route("/api/images/<device_id>/<filename>")
+def get_image(device_id: str, filename: str):
+    dev = get_device_by_device_id(device_id)
+    if not dev:
+        return jsonify({"error": "Device not found"}), 404
+    safe_filename = secure_filename(filename)
+    return send_from_directory(IMAGE_UPLOAD_FOLDER, safe_filename)
+
 if __name__ == "__main__":
     init_runtime_and_scheduler()
     socketio.run(app, debug=os.getenv("FLASK_DEBUG", "0") == "1", host="0.0.0.0", port=5000)
+

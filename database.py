@@ -3,7 +3,6 @@ import os
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 
-# 데이터베이스 파일 경로 설정
 DATABASE_FILE = 'greeneye_users.db'
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(BASE_DIR, DATABASE_FILE)
@@ -11,55 +10,79 @@ DB_PATH = os.path.join(BASE_DIR, DATABASE_FILE)
 def get_db_connection():
     """SQLite 데이터베이스 연결을 반환합니다."""
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row # 결과를 딕셔너리처럼 접근할 수 있게 설정
+    conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
-    """데이터베이스를 초기화하고 user, devices, plant_images 테이블을 생성합니다."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+def _column_exists(conn, table, column):
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    cols = [r["name"] for r in cur.fetchall()]
+    return column in cols
 
-    # 1. user 테이블 (회원가입 정보)
-    cursor.execute('''
+def _index_exists(conn, index_name):
+    cur = conn.execute("PRAGMA index_list(devices)")
+    names = [r["name"] for r in cur.fetchall()]
+    return index_name in names
+
+def init_db():
+    """
+    테이블 생성 + 경량 마이그레이션:
+      - devices: device_id(UNIQUE) 추가
+      - plant_images: device_id 컬럼 추가
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # 1) users
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL
         )
-    ''')
+    """)
 
-    # 2. devices 테이블 (단말기 등록 및 MAC-friendly_name 매핑용)
-    cursor.execute('''
+    # 2) devices
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS devices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             mac_address TEXT UNIQUE NOT NULL,
             friendly_name TEXT UNIQUE NOT NULL,
-            registered_at TEXT NOT NULL
+            registered_at TEXT NOT NULL,
+            device_id TEXT UNIQUE NOT NULL
         )
-    ''')
+    """)
+    # 기존 행에 device_id 채우기 (mac 마지막 4자리)
+    cur.execute("SELECT id, mac_address, device_id FROM devices")
+    for row in cur.fetchall():
+        if not row["device_id"] and row["mac_address"]:
+            dev_id = row["mac_address"].replace(":", "").lower()[-4:]
+            conn.execute("UPDATE devices SET device_id = ? WHERE id = ?", (dev_id, row["id"]))
+    conn.commit()
+    # 고유 인덱스
+    if not _index_exists(conn, "idx_devices_device_id_unique"):
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_device_id_unique ON devices(device_id)")
+        conn.commit()
 
-    # 3. plant_images 테이블 (이미지 메타데이터 저장용)
-    cursor.execute('''
+    # 3) plant_images
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS plant_images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             mac_address TEXT NOT NULL,
             filename TEXT NOT NULL UNIQUE,
             filepath TEXT NOT NULL,
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            device_id TEXT NOT NULL
         )
-    ''')
-    conn.commit()
+    """)
     conn.close()
-    print(f"Database initialized and tables created at {DB_PATH}")
+    print(f"Database initialized/migrated at {DB_PATH}")
 
 def add_user(email, password):
-    """새로운 사용자를 데이터베이스에 추가합니다."""
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cur = conn.cursor()
     password_hash = generate_password_hash(password)
-    
     try:
-        cursor.execute("INSERT INTO users (email, password_hash) VALUES (?, ?)", (email, password_hash))
+        cur.execute("INSERT INTO users (email, password_hash) VALUES (?, ?)", (email, password_hash))
         conn.commit()
         print(f"User '{email}' added successfully.")
         return True
@@ -70,74 +93,78 @@ def add_user(email, password):
         conn.close()
 
 def get_user_by_email(email):
-    """이메일을 통해 사용자를 조회합니다."""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
-    user = cursor.fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email = ?", (email,))
+    user = cur.fetchone()
     conn.close()
     return user
 
 def get_all_users():
-    """모든 사용자를 조회합니다."""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users")
-    users = cursor.fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users")
+    users = cur.fetchall()
     conn.close()
     return users
 
 def check_password(hashed_password, password):
-    """해싱된 비밀번호와 입력된 비밀번호를 비교합니다."""
     return check_password_hash(hashed_password, password)
 
 def add_device(mac_address, friendly_name):
-    """새로운 단말기(MAC 주소)와 친근한 이름을 DB에 추가합니다."""
+    """
+    MAC, friendly_name 저장 + device_id 자동 생성(MAC 하위 4자리, 소문자)
+    """
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
+    cur = conn.cursor()
     registered_at = datetime.utcnow().isoformat()
-    
+    device_id = mac_address.replace(":", "").lower()[-4:]
     try:
-        cursor.execute("INSERT INTO devices (mac_address, friendly_name, registered_at) VALUES (?, ?, ?)", 
-                       (mac_address, friendly_name, registered_at))
+        cur.execute(
+            "INSERT INTO devices (mac_address, friendly_name, registered_at, device_id) VALUES (?, ?, ?, ?)",
+            (mac_address, friendly_name, registered_at, device_id)
+        )
         conn.commit()
-        print(f"Device '{mac_address}' with name '{friendly_name}' added successfully.")
+        print(f"Device '{mac_address}' as '{friendly_name}' (device_id={device_id}) added.")
         return True
     except sqlite3.IntegrityError:
-        print(f"Device with MAC address '{mac_address}' already exists.")
+        print(f"Device (MAC or name or device_id) already exists.")
         return False
     finally:
         conn.close()
 
 def get_device_by_mac(mac_address):
-    """MAC 주소로 단말기 정보를 조회합니다."""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_address,))
-    device = cursor.fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_address,))
+    device = cur.fetchone()
     conn.close()
     return device
-    
-def get_device_by_friendly_name(friendly_name):
-    """친근한 이름으로 단말기 정보를 조회합니다."""
+
+def get_device_by_device_id(device_id: str):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM devices WHERE friendly_name = ?", (friendly_name,))
-    device = cursor.fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM devices WHERE device_id = ?", (device_id.lower(),))
+    device = cur.fetchone()
+    conn.close()
+    return device
+
+def get_device_by_friendly_name(friendly_name):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM devices WHERE friendly_name = ?", (friendly_name,))
+    device = cur.fetchone()
     conn.close()
     return device
 
 def get_all_devices():
-    """모든 등록된 단말기를 조회합니다."""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM devices")
-    devices = cursor.fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM devices")
+    devices = cur.fetchall()
     conn.close()
     return devices
 
-# 이 파일을 직접 실행할 때만 DB를 초기화하도록 설정
 if __name__ == '__main__':
     init_db()
     print("Database ready.")

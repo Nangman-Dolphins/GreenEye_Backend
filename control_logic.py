@@ -1,51 +1,59 @@
-import json
 from datetime import datetime
 import pytz
+import json
 
 from services import send_config_to_device, get_redis_data
+from database import get_device_by_friendly_name
 
-def check_and_apply_auto_control(mac_address: str):
-    """
-    특정 단말기의 센서 데이터를 확인하고 자동 제어 규칙을 적용합니다.
-    """
+def check_and_apply_auto_control(device_id: str):
     tz = pytz.timezone("Asia/Seoul")
     now_kst = datetime.now(tz)
     hour = now_kst.hour
 
-    print(f"\n[Auto Control] Checking conditions for {mac_address} at {now_kst.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    latest = get_redis_data(f"latest_sensor_data:{mac_address}")
+    latest = get_redis_data(f"latest_sensor_data:{device_id}")
     if not latest:
-        print(f"[Auto Control] No latest sensor data found for {mac_address}. Skipping.")
+        print(f"[Auto Control] No latest sensor data for {device_id}.")
         return
 
     soil_moisture = latest.get("soil_moisture")
     light_lux = latest.get("light_lux")
 
-    # 현재 액추에이터 상태(중복 명령 방지)
-    pump_state = get_redis_data(f"actuator_state:{mac_address}:water_pump") or {}
-    pump_on = pump_state.get("status") == "on"
+    pump_state_data = get_redis_data(f"actuator_state:{device_id}:water_pump")
+    current_pump_status = pump_state_data.get("status") if pump_state_data else "off"
 
-    led_state = get_redis_data(f"actuator_state:{mac_address}:led") or {}
-    led_on = led_state.get("status") == "on"
+    led_state_data = get_redis_data(f"actuator_state:{device_id}:flash") # flash_en 값을 제어
+    current_led_status = led_state_data.get("flash_en") if led_state_data else 0 # 0=off
 
-    # 1) 토양 수분 펌프
     if soil_moisture is not None:
-        if soil_moisture < 300 and not pump_on:
-            print(f"[Auto Control] {mac_address}: Soil moisture {soil_moisture} LOW -> pump ON")
-            send_config_to_device(mac_address, {"device": "water_pump", "action": "on", "duration_sec": 5})
-        elif soil_moisture > 700 and pump_on:
-            print(f"[Auto Control] {mac_address}: Soil moisture {soil_moisture} HIGH -> pump OFF")
-            send_config_to_device(mac_address, {"device": "water_pump", "action": "off"})
+        if soil_moisture < 300 and current_pump_status != "on":
+            send_config_to_device(device_id, {"water_pump_action": 1, "water_pump_duration": 5}) # 가정
+        elif soil_moisture > 700 and current_pump_status != "off":
+            send_config_to_device(device_id, {"water_pump_action": 0})
 
-    # 2) 조도 LED (07~20시)
     if light_lux is not None and 7 <= hour <= 20:
-        if light_lux < 500 and not led_on:
-            print(f"[Auto Control] {mac_address}: Light {light_lux} LOW -> LED ON")
-            send_config_to_device(mac_address, {"device": "led", "action": "on"})
-        elif light_lux > 800 and led_on:
-            print(f"[Auto Control] {mac_address}: Light {light_lux} HIGH -> LED OFF")
-            send_config_to_device(mac_address, {"device": "led", "action": "off"})
-    elif led_on:
-        print(f"[Auto Control] {mac_address}: Night time {hour}h -> LED OFF")
-        send_config_to_device(mac_address, {"device": "led", "action": "off"})
+        if light_lux < 500 and current_led_status != 1: # flash_en이 켜지지 않았을 때
+            send_config_to_device(device_id, {"flash_en": 1, "flash_level": 128})
+        elif light_lux > 800 and current_led_status != 0:
+            send_config_to_device(device_id, {"flash_en": 0})
+    else:
+        if current_led_status != 0:
+            send_config_to_device(device_id, {"flash_en": 0, "flash_nt": 1, "flash_level": 180})
+
+def handle_manual_control(device_id: str, device_type: str, action: str, duration_sec: int = 0):
+    print(f"[Manual Control] Received command for {device_id}, device: {device_type}, action: {action}")
+    
+    config_payload = {}
+    if device_type == "water_pump":
+        config_payload = {"water_pump_action": 1 if action == "on" else 0, "water_pump_duration": duration_sec}
+    elif device_type == "led":
+        flash_state = 1 if action == "on" else 0
+        config_payload = {"flash_en": flash_state}
+    elif device_type == "humidifier":
+        config_payload = {"humidifier_action": 1 if action == "on" else 0}
+        
+    if config_payload:
+        send_config_to_device(device_id, config_payload)
+        return {"status": "success", "message": f"Manual control command '{action}' for '{device_type}' sent to {device_id}"}
+    
+    return {"status": "error", "message": f"Unknown device type '{device_type}'"}
+

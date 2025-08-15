@@ -5,9 +5,12 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 import redis
 from datetime import datetime
+import base64
 from werkzeug.utils import secure_filename
+import uuid
+import requests
 
-from database import get_db_connection
+from database import get_db_connection, get_device_by_device_id
 from ai_inference import run_inference_on_image
 
 from dotenv import load_dotenv
@@ -65,27 +68,6 @@ def connect_mqtt():
     except Exception as e:
         print(f"Could not connect to MQTT broker: {e}")
 
-# --- InfluxDB / Redis ---
-def connect_influxdb():
-    global influxdb_client, influxdb_write_api
-    try:
-        influxdb_client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
-        influxdb_write_api = influxdb_client.write_api(write_options=SYNCHRONOUS)
-        print(f"Connected to InfluxDB at {INFLUXDB_URL}")
-    except Exception as e:
-        print(f"Could not connect to InfluxDB: {e}")
-
-def connect_redis():
-    global redis_client
-    try:
-        redis_client = redis.StrictRedis(
-            host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True
-        )
-        redis_client.ping()
-        print(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
-    except Exception as e:
-        print(f"Could not connect to Redis: {e}")
-
 def write_sensor_data_to_influxdb(measurement, tags, fields):
     if not influxdb_write_api:
         return
@@ -131,84 +113,106 @@ def get_redis_data(key: str):
 # --- 데이터 파이프라인 ---
 def process_incoming_data(topic: str, payload: dict):
     """
-    MQTT로 수신된 센서(+이미지) 데이터를 처리.
+    MQTT로 수신된 센서(+이미지) 데이터 처리.
+    센서 스펙: bat_level, amb_temp, amb_humi, amb_light, soil_temp, soil_humi, soil_ec, plant_img(HEX)
     """
     try:
-        mac = topic.split("/")[-1]
-        print(f"Processing data for device: {mac}")
+        # 토픽: GreenEye/data/{DeviceID}
+        device_id = topic.split("/")[-1].lower()
+        print(f"Processing data for device_id: {device_id}")
 
-        # 1) 센서
-        tags = {"mac_address": mac}
-        fields = {
-            "battery": payload.get("bat_level"),
-            "temperature": payload.get("amb_temp"),
-            "humidity": payload.get("amb_humi"),
-            "light_lux": payload.get("amb_light"),
-            "soil_temp": payload.get("soil_temp"),
-            "soil_moisture": payload.get("soil_humi"),
-            "soil_ec": payload.get("soil_ec"),
-        }
-        valid_fields = {k: v for k, v in fields.items() if v is not None}
-        if valid_fields:
-            write_sensor_data_to_influxdb("sensor_readings", tags, valid_fields)
-            set_redis_data(f"latest_sensor_data:{mac}", {"timestamp": datetime.utcnow().isoformat(), **valid_fields})
-            print(f"Sensor data processed and stored for {mac}")
+        dev = get_device_by_device_id(device_id)
+        mac = dev["mac_address"] if dev else None
 
-        # 2) 이미지
-        image_hex = payload.get("plant_img")
-        if image_hex:
-            image_bytes = bytes.fromhex(image_hex)
-            filename = f"{mac}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
-            path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
-            os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(image_bytes)
+        # --- 데이터 종류에 따라 분기 처리 (plant_img 키 유무로 판단) ---
+        if "plant_img" in payload:
+            # 이미지 데이터 처리
+            image_hex = payload.get("plant_img")
+            if image_hex:
+                image_bytes = bytes.fromhex(image_hex)
+                filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+                path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
+                os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(image_bytes)
 
-            conn = get_db_connection()
-            conn.execute(
-                "INSERT INTO plant_images (mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?)",
-                (mac, filename, path, datetime.utcnow().isoformat()),
-            )
-            conn.commit()
-            conn.close()
+                conn = get_db_connection()
+                conn.execute(
+                    "INSERT INTO plant_images (device_id, mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (device_id, mac, filename, path, datetime.utcnow().isoformat()),
+                )
+                conn.commit()
+                conn.close()
 
-            set_redis_data(f"latest_image:{mac}", {"filename": filename})
-            print(f"Image saved: {path}")
+                set_redis_data(f"latest_image:{device_id}", {"filename": filename})
+                print(f"Image saved: {path}")
 
-            diagnosis = run_inference_on_image(mac, path)
-            set_redis_data(f"latest_ai_diagnosis:{mac}", diagnosis)
-            print(f"AI inference complete for {mac}")
+                diagnosis = run_inference_on_image(device_id, path)
+                set_redis_data(f"latest_ai_diagnosis:{device_id}", diagnosis)
+                print(f"AI inference complete for {device_id}")
+
+        else:
+            # 센서 데이터 처리
+            tags = {"device_id": device_id}
+            if mac:
+                tags["mac_address"] = mac
+
+            fields = {
+                "battery": payload.get("bat_level"),
+                "temperature": payload.get("amb_temp"),
+                "humidity": payload.get("amb_humi"),
+                "light_lux": payload.get("amb_light"),
+                "soil_temp": payload.get("soil_temp"),
+                "soil_moisture": payload.get("soil_humi"),
+                "soil_ec": payload.get("soil_ec"),
+            }
+            valid_fields = {k: v for k, v in fields.items() if v is not None}
+            if valid_fields:
+                write_sensor_data_to_influxdb("sensor_readings", tags, valid_fields)
+                set_redis_data(f"latest_sensor_data:{device_id}", {"timestamp": datetime.utcnow().isoformat(), **valid_fields})
+                print(f"Sensor data processed and stored for {device_id}")
 
     except Exception as e:
         print(f"Error in process_incoming_data for topic {topic}: {e}")
 
-# --- 장치 통신 ---
-def request_data_from_device(mac_address: str):
-    topic = f"GreenEye/req/{mac_address}"
-    payload = json.dumps({"req": 0})
-    mqtt_client.publish(topic, payload)
-    print(f"Sent data request to topic: {topic}")
+# --- 장치 통신 (DeviceID 기준) ---
+def request_data_from_device(device_id: str, sensor_only: bool = False):
+    topic = f"GreenEye/req/{device_id}"
+    payload = {"req": 1 if sensor_only else 0}
+    mqtt_client.publish(topic, json.dumps(payload))
+    print(f"Sent data request to topic: {topic} payload={payload}")
 
-def send_config_to_device(mac_address: str, config_payload: dict):
-    """
-    설정 변경 명령 전송.
-    [개선] 전송 직후 Redis에 낙관적 상태(optimistic) 기록 → UI/로직 동기화.
-    """
-    topic = f"GreenEye/conf/{mac_address}"
-    payload = json.dumps(config_payload)
-    mqtt_client.publish(topic, payload)
-    print(f"Sent config to topic: {topic} with payload: {payload}")
+def send_config_to_device(device_id: str, config_payload: dict):
+    allowed = {"flash_en": (0, 1), "flash_nt": (0, 1), "flash_level": (0, 255)}
+    to_send = {}
+    for k, v in (config_payload or {}).items():
+        if k in allowed:
+            lo, hi = allowed[k]
+            if isinstance(v, int) and lo <= v <= hi:
+                to_send[k] = v
 
-    device = config_payload.get("device")
-    action = config_payload.get("action")
-    if device in ("water_pump", "led") and action in ("on", "off"):
-        try:
-            set_redis_data(
-                f"actuator_state:{mac_address}:{device}",
-                {"status": action, "ts": datetime.utcnow().isoformat()},
-            )
-        except Exception as e:
-            print(f"Failed to set optimistic actuator state: {e}")
+    topic = f"GreenEye/conf/{device_id}"
+    mqtt_client.publish(topic, json.dumps(to_send))
+    print(f"Sent config to topic: {topic} payload={to_send}")
+
+    if "flash_en" in to_send or "flash_nt" in to_send or "flash_level" in to_send:
+        set_redis_data(
+            f"actuator_state:{device_id}:flash",
+            {"ts": datetime.utcnow().isoformat(), **to_send},
+        )
+
+# --- 헬스체크용 ---
+def is_connected_mqtt():
+    return mqtt_client.is_connected()
+
+def is_connected_influx():
+    return influxdb_client is not None
+
+def is_connected_redis():
+    try:
+        return redis_client is not None and redis_client.ping()
+    except:
+        return False
 
 # --- 초기화 ---
 def initialize_services():
