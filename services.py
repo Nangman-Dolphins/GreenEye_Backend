@@ -92,16 +92,21 @@ def on_message(client, userdata, msg):
             print(f"Error processing incoming data: {e}")
 
 def connect_mqtt():
+    # ✅ 환경변수에서 가져오되 없으면 기본값 사용
+    broker_host = os.getenv("MQTT_BROKER_HOST", "localhost")
+    broker_port = int(os.getenv("MQTT_BROKER_PORT", 1883))
+
     if MQTT_USERNAME and MQTT_PASSWORD:
         mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
+    
     try:
-        # mqtt_client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60)
-        mqtt_client.connect("localhost", 1883)
+        mqtt_client.connect(broker_host, broker_port, 60)
         mqtt_client.loop_start()
     except Exception as e:
-        print(f"Could not connect to MQTT broker: {e}")
+        print(f"Could not connect to MQTT broker at {broker_host}:{broker_port} → {e}")
 
 def write_sensor_data_to_influxdb(measurement, tags, fields):
     if not influxdb_write_api:
@@ -224,6 +229,23 @@ def process_incoming_data(topic: str, payload: dict):
 #     payload = {"req": 1 if sensor_only else 0}
 #     mqtt_client.publish(topic, json.dumps(payload))
 #     print(f"Sent data request to topic: {topic} payload={payload}")
+
+# 프리셋 모드 매핑(임시) 정의
+PRESET_MODES = {
+    "Z": {"pwr_mode": "Z", "nht_mode": 1, "flash_en": 0, "flash_nt": 0, "flash_level": 0},
+    "L": {"pwr_mode": "L", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": 120},
+    "M": {"pwr_mode": "M", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": 160},
+    "H": {"pwr_mode": "H", "nht_mode": 1, "flash_en": 1, "flash_nt": 1, "flash_level": 200},
+    "U": {"pwr_mode": "U", "nht_mode": 0, "flash_en": 1, "flash_nt": 1, "flash_level": 255},
+}
+
+# 프리셋 모드 전송 함수 정의
+def send_mode_to_device(device_id: str, mode: str):
+    if mode not in PRESET_MODES:
+        raise ValueError(f"Invalid mode '{mode}'. Must be one of {list(PRESET_MODES.keys())}.")
+    config = PRESET_MODES[mode]
+    send_config_to_device(device_id, config)
+    return config
 
 def send_config_to_device(device_id: str, config_payload: dict):
     if not mqtt_client.is_connected():

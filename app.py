@@ -23,8 +23,10 @@ from services import (
     set_redis_data,
     process_incoming_data,
     send_config_to_device,
-    is_connected_influx, is_connected_mqtt, is_connected_redis
+    is_connected_influx, is_connected_mqtt, is_connected_redis,
+    send_mode_to_device
 )
+
 from database import (
     init_db,
     add_user,
@@ -215,6 +217,23 @@ def control_device(device_id: str):
         return jsonify({"error": "Request body must be JSON"}), 400
     send_config_to_device(device_id, config_data)
     return jsonify({"status": "success", "message": f"Configuration sent to {device_id}"})
+
+@app.route("/api/control_mode/<device_id>", methods=["POST"])
+def control_device_by_mode(device_id: str):
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+    if not mode:
+        return jsonify({"error": "Missing 'mode' in request body"}), 400
+    try:
+        config = send_mode_to_device(device_id, mode)
+        return jsonify({
+            "status": "success",
+            "device_id": device_id,
+            "mode": mode,
+            "applied_config": config
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 @app.route("/api/auth/register", methods=["POST"])
 def register_user():
