@@ -5,10 +5,7 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 import redis
 from datetime import datetime
-import base64
 from werkzeug.utils import secure_filename
-import uuid
-import requests
 
 from database import get_db_connection, get_device_by_device_id
 from ai_inference import run_inference_on_image
@@ -39,6 +36,43 @@ influxdb_client = None
 influxdb_write_api = None
 redis_client = None
 
+# --- Redis 연결 ---
+def connect_redis():
+    global redis_client
+    try:
+        redis_client = redis.Redis(
+            host=os.getenv("REDIS_HOST", "redis"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            password=os.getenv("REDIS_PASSWORD") or None,
+            db=0,
+            decode_responses=True,
+            health_check_interval=30,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
+        redis_client.ping()
+        print("Redis connected.")
+    except Exception as e:
+        redis_client = None
+        print(f"Redis connection failed: {e}")
+
+def connect_influxdb():
+    """InfluxDB v2 연결"""
+    global influxdb_client, influxdb_write_api
+    try:
+        influxdb_client = InfluxDBClient(
+            url=INFLUXDB_URL,
+            token=INFLUXDB_TOKEN,
+            org=INFLUXDB_ORG,
+            timeout=30000,  # ms
+        )
+        influxdb_write_api = influxdb_client.write_api(write_options=SYNCHRONOUS)
+        print("InfluxDB connected.")
+    except Exception as e:
+        influxdb_client = None
+        influxdb_write_api = None
+        print(f"InfluxDB connection failed: {e}")
+
 # --- MQTT 콜백 ---
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
@@ -63,7 +97,8 @@ def connect_mqtt():
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
     try:
-        mqtt_client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60)
+        # mqtt_client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60)
+        mqtt_client.connect("localhost", 1883)
         mqtt_client.loop_start()
     except Exception as e:
         print(f"Could not connect to MQTT broker: {e}")
@@ -136,13 +171,19 @@ def process_incoming_data(topic: str, payload: dict):
                 with open(path, "wb") as f:
                     f.write(image_bytes)
 
-                conn = get_db_connection()
-                conn.execute(
-                    "INSERT INTO plant_images (device_id, mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?, ?)",
-                    (device_id, mac, filename, path, datetime.utcnow().isoformat()),
-                )
-                conn.commit()
-                conn.close()
+                if mac:
+                    try:
+                        with get_db_connection() as conn:
+                            conn.execute(
+                                "INSERT INTO plant_images (device_id, mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?, ?)",
+                                (device_id, mac, filename, path, datetime.utcnow().isoformat()),
+                            )
+                            conn.commit()
+                    except Exception as e:
+                        print(f"Failed to save image meta to DB for {device_id}: {e}")
+                else:
+                    # 디바이스 미등록이면 plant_images는 device_id / mac_address NOT NULL 때문에 에러 나니 저장 스킵
+                    print(f"Skip DB insert for image because device not registered: {device_id}")
 
                 set_redis_data(f"latest_image:{device_id}", {"filename": filename})
                 print(f"Image saved: {path}")
@@ -176,30 +217,49 @@ def process_incoming_data(topic: str, payload: dict):
         print(f"Error in process_incoming_data for topic {topic}: {e}")
 
 # --- 장치 통신 (DeviceID 기준) ---
-def request_data_from_device(device_id: str, sensor_only: bool = False):
-    topic = f"GreenEye/req/{device_id}"
-    payload = {"req": 1 if sensor_only else 0}
-    mqtt_client.publish(topic, json.dumps(payload))
-    print(f"Sent data request to topic: {topic} payload={payload}")
+
+# 이 함수는 현재 사용되지 않으며, SD 장치가 자율적으로 센싱 주기를 관리하기 때문에 일단 임시로 주석 처리
+# def request_data_from_device(device_id: str, sensor_only: bool = False):
+#     topic = f"GreenEye/req/{device_id}"
+#     payload = {"req": 1 if sensor_only else 0}
+#     mqtt_client.publish(topic, json.dumps(payload))
+#     print(f"Sent data request to topic: {topic} payload={payload}")
 
 def send_config_to_device(device_id: str, config_payload: dict):
-    allowed = {"flash_en": (0, 1), "flash_nt": (0, 1), "flash_level": (0, 255)}
+    if not mqtt_client.is_connected():
+        connect_mqtt()
+
+    allowed_int = {
+        "flash_en": (0, 1),
+        "flash_nt": (0, 1),
+        "flash_level": (0, 255),
+        "nht_mode": (0, 1)
+    }
+    allowed_str = {
+        "pwr_mode": {"Z", "L", "M", "H", "U"}
+    }
+
     to_send = {}
     for k, v in (config_payload or {}).items():
-        if k in allowed:
-            lo, hi = allowed[k]
+        if k in allowed_int:
+            lo, hi = allowed_int[k]
             if isinstance(v, int) and lo <= v <= hi:
                 to_send[k] = v
+        elif k in allowed_str:
+            if isinstance(v, str) and v.upper() in allowed_str[k]:
+                to_send[k] = v.upper()
 
     topic = f"GreenEye/conf/{device_id}"
-    mqtt_client.publish(topic, json.dumps(to_send))
-    print(f"Sent config to topic: {topic} payload={to_send}")
+    result = mqtt_client.publish(topic, json.dumps(to_send), retain=True)
+    result.wait_for_publish()  # ✅ 메시지 전송 완료까지 기다림
+    print(f"Sent config to topic: {topic} payload={to_send}")  
 
-    if "flash_en" in to_send or "flash_nt" in to_send or "flash_level" in to_send:
+    if any(k in to_send for k in ("flash_en", "flash_nt", "flash_level")):
         set_redis_data(
             f"actuator_state:{device_id}:flash",
             {"ts": datetime.utcnow().isoformat(), **to_send},
         )
+
         
 # --- MQTT 퍼블리시(앱에서 기대하는 공개 API) ---
 def publish_mqtt_message(topic: str, payload, qos: int = 0, retain: bool = False) -> bool:
@@ -248,7 +308,14 @@ def is_connected_redis():
 # --- 초기화 ---
 def initialize_services():
     print("\n--- Initializing Backend Services ---")
-    connect_mqtt()
-    connect_influxdb()
-    connect_redis()
+    for name in ("connect_mqtt", "connect_influxdb", "connect_redis"):
+        func = globals().get(name, None)
+        if callable(func):
+            try:
+                func()
+                print(f"{name} ok")
+            except Exception as e:
+                print(f"{name} failed: {e}")
+        else:
+            print(f"{name} not defined — skipping")
     print("--- All services connection attempts made. ---\n")

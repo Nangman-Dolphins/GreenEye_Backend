@@ -1,4 +1,4 @@
-import sqlite3
+import time, sqlite3
 import os
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
@@ -8,9 +8,11 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(BASE_DIR, DATABASE_FILE)
 
 def get_db_connection():
-    """SQLite 데이터베이스 연결을 반환합니다."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 def _column_exists(conn, table, column):
@@ -111,27 +113,32 @@ def get_all_users():
 def check_password(hashed_password, password):
     return check_password_hash(hashed_password, password)
 
+def _retry_locked(fn, *args, retries=5, delay=0.2, **kwargs):
+    for i in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and i < retries - 1:
+                time.sleep(delay * (i + 1))  # 점증 대기
+                continue
+            raise
+
 def add_device(mac_address, friendly_name):
-    """
-    MAC, friendly_name 저장 + device_id 자동 생성(MAC 하위 4자리, 소문자)
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
     registered_at = datetime.utcnow().isoformat()
     device_id = mac_address.replace(":", "").lower()[-4:]
     try:
-        cur.execute(
-            "INSERT INTO devices (mac_address, friendly_name, registered_at, device_id) VALUES (?, ?, ?, ?)",
-            (mac_address, friendly_name, registered_at, device_id)
-        )
-        conn.commit()
+        with get_db_connection() as conn:
+            _retry_locked(
+                conn.execute,
+                "INSERT INTO devices (mac_address, friendly_name, registered_at, device_id) VALUES (?, ?, ?, ?)",
+                (mac_address, friendly_name, registered_at, device_id)
+            )
+            conn.commit()
         print(f"Device '{mac_address}' as '{friendly_name}' (device_id={device_id}) added.")
         return True
     except sqlite3.IntegrityError:
-        print(f"Device (MAC or name or device_id) already exists.")
+        print("Device (MAC or name or device_id) already exists.")
         return False
-    finally:
-        conn.close()
 
 def get_device_by_mac(mac_address):
     conn = get_db_connection()

@@ -105,6 +105,16 @@ def before_first_request():
     with app.app_context():
         init_runtime_and_scheduler()
 
+def send_realtime_data_to_clients(device_id: str):
+    """Redis에 캐시된 최신 센서 데이터를 Socket.IO로 브로드캐스트."""
+    try:
+        data = get_redis_data(f"latest_sensor_data:{device_id}") or {}
+        # 원하는 이벤트/네임스페이스 명은 프로젝트에 맞게 조정
+        # 클라이언트에서 'realtime_data' 이벤트를 수신하도록 되어 있다면 그대로 사용
+        socketio.emit("realtime_data", {"device_id": device_id, **data})
+    except Exception as e:
+        print(f"Realtime push failed for {device_id}: {e}")
+
 def init_runtime_and_scheduler():
     initialize_services()
     init_db()
@@ -190,6 +200,11 @@ def get_historical_sensor_data(device_id: str):
 
 @app.route("/api/control_device/<device_id>", methods=["POST"])
 def control_device(device_id: str):
+    config_data = request.get_json() or {}
+    print("💡 Received config_data:", config_data)
+
+    send_config_to_device(device_id, config_data)
+    return jsonify({"status": "success", "message": f"Configuration sent to {device_id}"})
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
     dev = get_device_by_device_id(device_id)
@@ -231,21 +246,34 @@ def login_user():
     else:
         return jsonify({"error": "Invalid email or password"}), 401
 
+from werkzeug.utils import secure_filename  # get_image에서 사용
+
 @app.route("/api/register_device", methods=["POST"])
 def register_device():
-    if not request.is_json:
-        return jsonify({"error": "Request must be JSON"}), 400
-    data = request.get_json()
-    mac = data.get("mac_address")
-    friendly_name = data.get("friendly_name")
-    if not mac or not friendly_name:
-        return jsonify({"error": "MAC address and friendly name are required"}), 400
-    
-    device_id = mac.replace(":", "").lower()[-4:]
-    if add_device(mac, friendly_name, device_id):
-        return jsonify({"status": "success", "device_id": device_id, "message": "Device registered successfully"}), 201
-    else:
-        return jsonify({"error": "Device already exists"}), 409
+    try:
+        if not request.is_json:
+            return jsonify({"error": "Request must be JSON"}), 400
+
+        data = request.get_json(silent=True) or {}
+        mac = data.get("mac_address")
+        friendly_name = data.get("friendly_name")
+        if not mac or not friendly_name:
+            return jsonify({"error": "mac_address and friendly_name are required"}), 400
+
+        mac_norm = mac.upper()
+        device_id = mac_norm.replace(":", "").lower()[-4:]
+
+        created = add_device(mac_norm, friendly_name)  # add_device는 인자 2개
+
+        if created:
+            return jsonify({"message": "registered", "mac_address": mac_norm, "device_id": device_id}), 201
+        else:
+            return jsonify({"error": "Device already exists", "mac_address": mac_norm, "device_id": device_id}), 409
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "internal_error", "detail": str(e)}), 500
 
 @app.route("/api/images/<device_id>/<filename>")
 def get_image(device_id: str, filename: str):
