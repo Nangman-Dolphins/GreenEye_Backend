@@ -2,6 +2,9 @@ import os
 from datetime import datetime, timedelta
 import pytz
 import smtplib
+import matplotlib.pyplot as plt
+import io
+import base64
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -10,6 +13,28 @@ from database import get_db_connection, get_all_devices, get_device_by_device_id
 
 from dotenv import load_dotenv
 load_dotenv()
+
+def generate_line_chart(rows, field, ylabel):
+    times = [datetime.fromisoformat(r["_time"].replace("Z", "+00:00")) for r in rows if r.get(field) is not None]
+    values = [r.get(field) for r in rows if r.get(field) is not None]
+
+    if not times or not values:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6, 2.5))
+    ax.plot(times, values, marker='o', linestyle='-', color='blue')
+    ax.set_title(ylabel)
+    ax.set_xlabel("시간")
+    ax.set_ylabel(ylabel)
+    ax.grid(True)
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    plt.savefig(buffer, format='png')
+    plt.close(fig)
+    buffer.seek(0)
+    encoded = base64.b64encode(buffer.read()).decode('utf-8')
+    return f'<img src="data:image/png;base64,{encoded}" alt="{ylabel}" style="margin-bottom:10px;"/><br/>'
 
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
 EMAIL_HOST = os.getenv("EMAIL_HOST")
@@ -71,6 +96,25 @@ def generate_monthly_report_content_by_device(device_id: str, start_dt, end_dt, 
     html += "</ul>"
 
     html += "<h3>시간별 데이터 요약 (최근 10개)</h3>"
+    html += "<h3>환경 센서 시계열</h3>"
+    for field, label in [
+        ("amb_temp", "주변 온도 (°C)"),
+        ("amb_humi", "주변 습도 (%)"),
+        ("amb_light", "조도 (lux)")
+    ]:
+        chart = generate_line_chart(rows, field, label)
+        if chart:
+            html += chart
+
+    html += "<h3>토양 센서 시계열</h3>"
+    for field, label in [
+        ("soil_temp", "토양 온도 (°C)"),
+        ("soil_humi", "토양 수분 (%)"),
+        ("soil_ec", "토양 전도도 (uS/cm)")
+    ]:
+        chart = generate_line_chart(rows, field, label)
+        if chart:
+            html += chart
     html += "<table border='1' style='width:100%; border-collapse: collapse;'>"
     html += "<tr><th>시간</th><th>주변온도</th><th>주변습도</th><th>주변광도</th><th>토양온도</th><th>토양수분</th><th>토양전도도</th><th>배터리</th></tr>"
 
@@ -152,4 +196,5 @@ def send_monthly_reports_for_users():
     print("--- Monthly report generation and sending finished. ---\n")
 
 if __name__ == "__main__":
-    print("Run via app.py scheduler or Flask context.")
+    print("Running test email report manually...")
+    send_monthly_reports_for_users()
