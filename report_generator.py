@@ -107,21 +107,29 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name):
         doc.build(story)
         return filepath
 
-    def avg(values):
-        return sum(values) / len(values) if values else 0
-
     def pick(key):
         return [r.get(key) for r in rows if r.get(key) is not None]
 
+    def avg(values):
+        return sum(values) / len(values) if values else 0
+
+    latest_battery = None
+    for r in reversed(rows):
+        if r.get("battery") is not None:
+            latest_battery = r["battery"]
+            break
+
+    # 📊 통계 테이블
     stats = [
-    ["주변 평균 온도 (°C)", f"{avg(pick('temperature')):.2f}"],
-    ["주변 평균 습도 (%)", f"{avg(pick('humidity')):.2f}"],
-    ["주변 평균 조도 (lux)", f"{avg(pick('light_lux')):.2f}"],
-    ["토양 평균 온도 (°C)", f"{avg(pick('soil_temp')):.2f}"],
-    ["토양 평균 수분 (%)", f"{avg(pick('soil_moisture')):.2f}"],
-    ["토양 평균 전도도 (uS/cm)", f"{avg(pick('soil_ec')):.2f}"],
-    ["평균 배터리 잔량 (%)", f"{avg(pick('battery')):.2f}"],
+        ["주변 평균 온도 (°C)", f"{avg(pick('temperature')):.2f}"],
+        ["주변 평균 습도 (%)", f"{avg(pick('humidity')):.2f}"],
+        ["주변 평균 조도 (lux)", f"{avg(pick('light_lux')):.2f}"],
+        ["토양 평균 온도 (°C)", f"{avg(pick('soil_temp')):.2f}"],
+        ["토양 평균 수분 (%)", f"{avg(pick('soil_moisture')):.2f}"],
+        ["토양 평균 전도도 (uS/cm)", f"{avg(pick('soil_ec')):.2f}"],
+        ["현재 배터리 잔량 (%)", f"{latest_battery:.2f}" if latest_battery is not None else "데이터 없음"],
     ]
+    
     # ✅ 열 제목 행 추가
     table_data = [["항목", "평균값"]] + stats
     table = Table(table_data, colWidths=[6*cm, 4*cm])
