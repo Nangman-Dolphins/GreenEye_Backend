@@ -11,7 +11,7 @@ from database import get_db_connection, get_device_by_device_id
 from ai_inference import run_inference_on_image
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(dotenv_path=".env.local")
 
 # --- 환경 변수 ---
 MQTT_BROKER_HOST = os.getenv("MQTT_BROKER_HOST")
@@ -35,6 +35,7 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 influxdb_client = None
 influxdb_write_api = None
 redis_client = None
+query_api = None 
 
 # --- Redis 연결 ---
 def connect_redis():
@@ -58,7 +59,7 @@ def connect_redis():
 
 def connect_influxdb():
     """InfluxDB v2 연결"""
-    global influxdb_client, influxdb_write_api
+    global influxdb_client, influxdb_write_api, query_api
     try:
         influxdb_client = InfluxDBClient(
             url=INFLUXDB_URL,
@@ -67,6 +68,7 @@ def connect_influxdb():
             timeout=30000,  # ms
         )
         influxdb_write_api = influxdb_client.write_api(write_options=SYNCHRONOUS)
+        query_api = influxdb_client.query_api()
         print("InfluxDB connected.")
     except Exception as e:
         influxdb_client = None
@@ -123,13 +125,27 @@ def write_sensor_data_to_influxdb(measurement, tags, fields):
         print(f"Error writing to InfluxDB: {e}")
 
 def query_influxdb_data(query: str):
-    if not influxdb_client:
-        return []
     try:
-        tables = influxdb_client.query_api().query(query, org=INFLUXDB_ORG)
-        return [record.values for table in tables for record in table.records]
+        tables = query_api.query(org=INFLUXDB_ORG, query=query)
+        result = []
+        for table in tables:
+            for record in table.records:
+                values = record.values
+                # 🔍 pivot 여부에 따라 처리 다르게
+                if "_field" in values and "_value" in values:
+                    # 🟢 pivot 되지 않은 일반 쿼리
+                    result.append({
+                        "_time": values.get("_time"),
+                        "_field": values.get("_field"),
+                        "_value": values.get("_value"),
+                        "device_id": values.get("device_id")
+                    })
+                else:
+                    # 🔵 pivot된 결과 (열 이름이 각 필드)
+                    result.append(values)
+        return result
     except Exception as e:
-        print(f"Error querying data from InfluxDB: {e}")
+        print(f"[InfluxDB] Query failed: {e}")
         return []
 
 def set_redis_data(key: str, value):

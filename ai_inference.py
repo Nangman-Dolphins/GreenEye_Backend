@@ -28,7 +28,7 @@ def load_ai_model() -> bool:
 
 
 def run_inference_on_image(device_id: str, image_path: str) -> Dict[str, Any]:
-    """
+    """3
     이미지 파일이 존재하는지만 확인하고, 고정된 스텁 결과를 반환.
     실제 모델로 교체 시, 반환 포맷은 유지하는 걸 권장.
     """

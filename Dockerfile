@@ -5,7 +5,10 @@ FROM python:3.12-alpine
 WORKDIR /app
 
 # 로컬의 requirements.txt 파일을 컨테이너의 /app 디렉토리로 복사
-COPY requirements.txt ./
+COPY requirements.txt .
+
+# 폰트 파일을 컨테이너 안으로 복사
+COPY fonts /app/fonts
 
 # 복사한 requirements.txt를 사용해 파이썬 패키지들을 설치
 RUN pip install --no-cache-dir -r requirements.txt

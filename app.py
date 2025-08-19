@@ -41,7 +41,7 @@ from control_logic import (
     handle_manual_control,
     check_and_apply_auto_control
 )
-from report_generator import send_monthly_reports_for_users, generate_monthly_report_content_by_device
+from report_generator import send_all_reports
 
 load_dotenv()
 app = Flask(__name__)
@@ -139,7 +139,7 @@ def init_runtime_and_scheduler():
             scheduler.add_job(send_realtime_data_to_clients, "interval", seconds=5, args=[device_id], id=f"realtime_data_job_{device_id}", replace_existing=True)
             print(f"Scheduled realtime data push for {friendly_name} ({device_id}) every 5 seconds.")
 
-    scheduler.add_job(send_monthly_reports_for_users, "cron", day="1", hour="0", minute="5", id="monthly_report_job", replace_existing=True)
+    scheduler.add_job(send_all_reports, "cron", day="1", hour="0", minute="5", id="monthly_report_job", replace_existing=True)
     print("Scheduled monthly report job to run on the 1st of every month at 00:05.")
     
     scheduler.start()
