@@ -113,6 +113,20 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name):
     def avg(values):
         return sum(values) / len(values) if values else 0
 
+    # 🔋 배터리 수준 판별 함수
+    def battery_status_string(level):
+        if level is None:
+            return "데이터 없음"
+        elif level >= 75:
+            return f"매우 양호 ({level:.2f}%)"
+        elif level >= 40:
+            return f"양호 ({level:.2f}%)"
+        elif level >= 15:
+            return f"부족 ({level:.2f}%)"
+        else:
+            return f"매우 낮음 ({level:.2f}%)"
+
+    # 🔍 최신 배터리 값 추출
     latest_battery = None
     for r in reversed(rows):
         if r.get("battery") is not None:
@@ -127,7 +141,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name):
         ["토양 평균 온도 (°C)", f"{avg(pick('soil_temp')):.2f}"],
         ["토양 평균 수분 (%)", f"{avg(pick('soil_moisture')):.2f}"],
         ["토양 평균 전도도 (uS/cm)", f"{avg(pick('soil_ec')):.2f}"],
-        ["현재 배터리 잔량 (%)", f"{latest_battery:.2f}" if latest_battery is not None else "데이터 없음"],
+        ["현재 배터리 상태", battery_status_string(latest_battery)],
     ]
     
     # ✅ 열 제목 행 추가
