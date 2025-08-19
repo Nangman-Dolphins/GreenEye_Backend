@@ -114,21 +114,24 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name):
         return [r.get(key) for r in rows if r.get(key) is not None]
 
     stats = [
-        ["주변 평균 온도 (°C)", f"{avg(pick('temperature')):.2f}"],
-        ["주변 평균 습도 (%)", f"{avg(pick('humidity')):.2f}"],
-        ["주변 평균 조도 (lux)", f"{avg(pick('light_lux')):.2f}"],
-        ["토양 평균 온도 (°C)", f"{avg(pick('soil_temp')):.2f}"],
-        ["토양 평균 수분 (%)", f"{avg(pick('soil_moisture')):.2f}"],
-        ["토양 평균 전도도 (uS/cm)", f"{avg(pick('soil_ec')):.2f}"],
-        ["평균 배터리 잔량 (%)", f"{avg(pick('battery')):.2f}"],
+    ["주변 평균 온도 (°C)", f"{avg(pick('temperature')):.2f}"],
+    ["주변 평균 습도 (%)", f"{avg(pick('humidity')):.2f}"],
+    ["주변 평균 조도 (lux)", f"{avg(pick('light_lux')):.2f}"],
+    ["토양 평균 온도 (°C)", f"{avg(pick('soil_temp')):.2f}"],
+    ["토양 평균 수분 (%)", f"{avg(pick('soil_moisture')):.2f}"],
+    ["토양 평균 전도도 (uS/cm)", f"{avg(pick('soil_ec')):.2f}"],
+    ["평균 배터리 잔량 (%)", f"{avg(pick('battery')):.2f}"],
     ]
-    table = Table(stats, colWidths=[6*cm, 4*cm])
+    # ✅ 열 제목 행 추가
+    table_data = [["항목", "평균값"]] + stats
+    table = Table(table_data, colWidths=[6*cm, 4*cm])
     table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),             # 제목 행 배경색
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),       # 제목 행 글자색
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, -1), 'NotoSansKR'),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('FONTNAME', (0, 0), (-1, -1), 'NotoSansKR'),            # 전체에 폰트 적용
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),                  # 제목 행 아래 여백
         ('GRID', (0, 0), (-1, -1), 1, colors.black),
     ]))
     story.append(table)
