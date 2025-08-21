@@ -1,6 +1,8 @@
 # 베이스 이미지: Python 3.12를 기반으로 하는 가벼운 Alpine Linux 이미지 사용
 FROM python:3.12-alpine
 
+ENV PYTHONUNBUFFERED=1
+
 # 컨테이너 내에서 작업할 디렉토리를 /app으로 설정
 WORKDIR /app
 
@@ -22,4 +24,4 @@ EXPOSE 5000
 # 컨테이너 시작 시 실행될 명령어
 # Flask 앱을 Gunicorn이라는 프로덕션용 WSGI 서버로 실행합니다.
 # 워커(worker)는 2개로 설정하며, 호스트 0.0.0.0의 5000번 포트에서 실행합니다.
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "app:app"]
+CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:5000", "wsgi:app"]

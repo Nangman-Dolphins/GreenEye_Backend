@@ -1,21 +1,56 @@
-# Python virtual environment
-venv/
-
-# Docker Compose environment variables / local configurations
+# === Environment secrets ===
 .env
-docker-compose.yml
-mosquitto_config/mosquitto.conf
-influxdb_data/
-redis_data/
-mosquitto_data/
-mosquitto_log/
+.env.local
+.env.docker
+.env.*
+!.env.example
 
-# Python specific
+# === Python build/cache ===
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+.eggs/
+*.spec
 
-# 이미지 업로드 폴더
+# === Virtual envs ===
+.venv/
+venv/
+env/
+
+# === Logs / temp ===
+*.log
+logs/
+tmp/
+.cache/
+.profile
+
+# === Databases / state ===
+*.db
+*.db-*
+*.sqlite3
+*.sqlite
+greeneye_users.db
+
+# === Generated artifacts ===
 images/
+reports/
+output/
+dist/
+build/
 
-# nginx 로컬 설정 폴더
-nginx_config/
+# === OS / IDE ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.code-workspace
+
+# === Keys / certs ===
+*.pem
+*.key
+*.crt
+
+# === Docker (local overrides) ===
+docker-compose.override.yml

@@ -16,7 +16,7 @@ services:
       - ./images:/app/images
       - ./greeneye_users.db:/app/greeneye_users.db
     env_file:
-      - .env
+      - .env.docker
     depends_on:
       mosquitto:
         condition: service_healthy
@@ -29,6 +29,8 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 20s
+
 
   # 2. Nginx 리버스 프록시
   nginx:
@@ -62,36 +64,29 @@ services:
       - greeneye_backend_mosquitto_data:/mosquitto/data
       - greeneye_backend_mosquitto_log:/mosquitto/log
     env_file:
-      - .env
+      - .env.docker
     healthcheck:
-      test: ["CMD-SHELL","mosquitto_sub -h localhost -t '$$SYS/#' -C 1 -W 5 -u ${MQTT_USERNAME} -P ${MQTT_PASSWORD}"]
+      test: ["CMD-SHELL","mosquitto_sub -h localhost -t '$$SYS/#' -C 1 -W 5 -u $${MQTT_USERNAME} -P $${MQTT_PASSWORD}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   # 4. InfluxDB 2.x
   influxdb:
-    image: influxdb:2.7.5
+    image: influxdb:2.7
     container_name: greeneye_influxdb
-    restart: unless-stopped
     ports:
       - "8086:8086"
-    env_file:
-      - .env
-    environment:
-      - DOCKER_INFLUXDB_INIT_MODE=setup
-      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_USERNAME}
-      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_PASSWORD}
-      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG}
-      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET}
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN}
     volumes:
       - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8086/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      test: ["CMD", "influx", "ping", "--host", "http://localhost:8086"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
 
   # 5. Redis
   redis:
@@ -104,9 +99,9 @@ services:
     volumes:
       - redis_data:/data
     env_file:
-      - .env
+      - .env.docker
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep -q PONG"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -115,4 +110,5 @@ volumes:
   greeneye_backend_mosquitto_data:
   greeneye_backend_mosquitto_log:
   influxdb_data:
+  influxdb_config:
   redis_data:

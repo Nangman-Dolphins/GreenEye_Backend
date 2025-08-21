@@ -3,6 +3,7 @@ import time
 import json
 import random
 import os
+import socket
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -12,6 +13,12 @@ load_dotenv()
 # --- 환경 변수 ---
 MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
 MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT', 1883))
+try:
+    socket.gethostbyname(MQTT_BROKER_HOST)
+except socket.gaierror:
+    print(f"[!] '{MQTT_BROKER_HOST}' 를 인식하지 못했습니다. localhost로 대체합니다.")
+    MQTT_BROKER_HOST = "localhost"
+
 MQTT_USERNAME = os.getenv('MQTT_USERNAME', 'greeneye_user')
 MQTT_PASSWORD = os.getenv('MQTT_PASSWORD', 'kitel1976!')
 
@@ -53,7 +60,7 @@ def device_id_from_mac(mac: str) -> str:
 def make_sensor_payload():
     """매뉴얼 키 이름으로 센서 페이로드 생성"""
     return {
-        "bat_level": random.randint(1, 100),
+        "bat_level": 50, 
         "amb_temp": round(random.uniform(20.0, 30.0), 2),
         "amb_humi": round(random.uniform(50.0, 80.0), 2),
         "amb_light": round(random.uniform(800, 2000), 2),

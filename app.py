@@ -45,6 +45,10 @@ from report_generator import send_all_reports
 
 load_dotenv()
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+initialize_services()
+
 from functools import wraps
 from threading import Lock
 from flask import request  # ← 추가
@@ -76,9 +80,6 @@ if not hasattr(app, "before_first_request"):
         return _return_original
 
     app.before_first_request = _before_first_request_decorator
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "super_secret_key_for_dev")
 
 IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), "images")
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
@@ -102,10 +103,10 @@ def token_required(f):
     return decorated
 
 
-@app.before_first_request
-def before_first_request():
-    with app.app_context():
-        init_runtime_and_scheduler()
+# @app.before_first_request
+# def before_first_request():
+#     with app.app_context():
+#         init_runtime_and_scheduler()
 
 def send_realtime_data_to_clients(device_id: str):
     """Redis에 캐시된 최신 센서 데이터를 Socket.IO로 브로드캐스트."""
@@ -118,33 +119,46 @@ def send_realtime_data_to_clients(device_id: str):
         print(f"Realtime push failed for {device_id}: {e}")
 
 def init_runtime_and_scheduler():
-    initialize_services()
-    init_db()
-    # load_ai_model() # 모델 준비 시 사용
+    print("🧪 [DEBUG] init_runtime_and_scheduler() 시작됨")
+    try:
+        print("[init] ⏳ initialize_services()...")
+        initialize_services()
+        print("[init] ✅ initialize_services() done")
 
-    scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
+        print("[init] ⏳ init_db()...")
+        init_db()
+        print("[init] ✅ init_db() done")
+
+        scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
+
+        print("[init] ⏳ get_all_devices()...")
+        devices = get_all_devices()
+        print(f"[init] ✅ Found {len(devices)} device(s) in DB")
+
+        if not devices:
+            print("No devices found in DB. Skipping scheduler setup for auto control.")
+        else:
+            for device in devices:
+                try:
+                    device_id = device['device_id']
+                    friendly_name = device['friendly_name']
+                    print(f"[init] ⏳ Scheduling jobs for {friendly_name} ({device_id})")
+
+                    scheduler.add_job(check_and_apply_auto_control, "interval", minutes=1, args=[device_id], id=f"auto_control_job_{device_id}", replace_existing=True)
+                    scheduler.add_job(send_realtime_data_to_clients, "interval", seconds=5, args=[device_id], id=f"realtime_data_job_{device_id}", replace_existing=True)
+                except Exception as inner_e:
+                    print(f"[init] ❌ Error scheduling job for device: {device} -> {inner_e}")
+
+        scheduler.add_job(send_all_reports, "cron", day="1", hour="0", minute="5", id="monthly_report_job", replace_existing=True)
+        print("[init] ✅ Scheduled monthly report job to run on the 1st of every month at 00:05")
+
+        scheduler.start()
+        print("[init] ✅ APScheduler started.")
     
-    devices = get_all_devices()
-    
-    if not devices:
-        print("No devices found in DB. Skipping scheduler setup for auto control.")
-    else:
-        for device in devices:
-            device_id = device['device_id']
-            friendly_name = device['friendly_name']
-
-            scheduler.add_job(check_and_apply_auto_control, "interval", minutes=1, args=[device_id], id=f"auto_control_job_{device_id}", replace_existing=True)
-            print(f"Scheduled auto control job for {friendly_name} ({device_id}) every 1 minutes.")
-            
-            scheduler.add_job(send_realtime_data_to_clients, "interval", seconds=5, args=[device_id], id=f"realtime_data_job_{device_id}", replace_existing=True)
-            print(f"Scheduled realtime data push for {friendly_name} ({device_id}) every 5 seconds.")
-
-    scheduler.add_job(send_all_reports, "cron", day="1", hour="0", minute="5", id="monthly_report_job", replace_existing=True)
-    print("Scheduled monthly report job to run on the 1st of every month at 00:05.")
-    
-    scheduler.start()
-    print("APScheduler started.")
-
+    except Exception as e:
+        import traceback
+        print("[init] ❌ Exception occurred in init_runtime_and_scheduler:")
+        traceback.print_exc()
 
 @app.route("/")
 def home():
@@ -202,19 +216,17 @@ def get_historical_sensor_data(device_id: str):
 
 @app.route("/api/control_device/<device_id>", methods=["POST"])
 def control_device(device_id: str):
-    config_data = request.get_json() or {}
-    print("💡 Received config_data:", config_data)
-
-    send_config_to_device(device_id, config_data)
-    return jsonify({"status": "success", "message": f"Configuration sent to {device_id}"})
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
+
     dev = get_device_by_device_id(device_id)
     if not dev:
         return jsonify({"error": "Device not found"}), 404
+
     config_data = request.get_json()
     if not config_data:
         return jsonify({"error": "Request body must be JSON"}), 400
+
     send_config_to_device(device_id, config_data)
     return jsonify({"status": "success", "message": f"Configuration sent to {device_id}"})
 
@@ -302,7 +314,14 @@ def get_image(device_id: str, filename: str):
     safe_filename = secure_filename(filename)
     return send_from_directory(IMAGE_UPLOAD_FOLDER, safe_filename)
 
-if __name__ == "__main__":
+# ✅ 이 위치에서 Gunicorn 실행 시만 초기화 실행
+if __name__ != "__main__":
+    print("🧪 [DEBUG] entered '__name__ != __main__' block")  # 🔍 이 줄이 로그에 보여야 함
     init_runtime_and_scheduler()
-    socketio.run(app, debug=os.getenv("FLASK_DEBUG", "0") == "1", host="0.0.0.0", port=5000)
+    print("🧪 [DEBUG] called init_runtime_and_scheduler()")
+    app.logger.info("✅ init_runtime_and_scheduler() 실행됨 (Gunicorn 포함)")
 
+if __name__ == "__main__":
+    with app.app_context():
+        init_runtime_and_scheduler()
+    socketio.run(app, debug=os.getenv("FLASK_DEBUG", "0") == "1", host="0.0.0.0", port=5000)

@@ -1,5 +1,6 @@
 import os
 import json
+import requests
 import paho.mqtt.client as mqtt
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -7,11 +8,16 @@ import redis
 from datetime import datetime
 from werkzeug.utils import secure_filename
 
+import csv
+from io import StringIO
+
 from database import get_db_connection, get_device_by_device_id
 from ai_inference import run_inference_on_image
 
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=".env.local")
+load_dotenv(dotenv_path=".env", override=False)
+if os.getenv("ENV_MODE", "local") == "local":
+    load_dotenv(dotenv_path=".env.local", override=True)
 
 # --- 환경 변수 ---
 MQTT_BROKER_HOST = os.getenv("MQTT_BROKER_HOST")
@@ -65,7 +71,7 @@ def connect_influxdb():
             url=INFLUXDB_URL,
             token=INFLUXDB_TOKEN,
             org=INFLUXDB_ORG,
-            timeout=30000,  # ms
+            timeout=30000,
         )
         influxdb_write_api = influxdb_client.write_api(write_options=SYNCHRONOUS)
         query_api = influxdb_client.query_api()
@@ -125,28 +131,27 @@ def write_sensor_data_to_influxdb(measurement, tags, fields):
         print(f"Error writing to InfluxDB: {e}")
 
 def query_influxdb_data(query: str):
+    print(f"[DEBUG] 실행할 Flux 쿼리:\n{query}")
     try:
-        tables = query_api.query(org=INFLUXDB_ORG, query=query)
-        result = []
-        for table in tables:
-            for record in table.records:
-                values = record.values
-                # 🔍 pivot 여부에 따라 처리 다르게
-                if "_field" in values and "_value" in values:
-                    # 🟢 pivot 되지 않은 일반 쿼리
-                    result.append({
-                        "_time": values.get("_time"),
-                        "_field": values.get("_field"),
-                        "_value": values.get("_value"),
-                        "device_id": values.get("device_id")
-                    })
-                else:
-                    # 🔵 pivot된 결과 (열 이름이 각 필드)
-                    result.append(values)
-        return result
+        url = f"{INFLUXDB_URL}/api/v2/query"
+        headers = {
+            "Authorization": f"Token {INFLUXDB_TOKEN}",
+            "Content-Type": "application/vnd.flux",
+            "Accept": "application/csv"
+        }
+        params = {
+            "org": INFLUXDB_ORG
+        }
+        response = requests.post(url, params=params, data=query.encode('utf-8'), headers=headers)
+        response.raise_for_status()
+
+        # 결과 디코딩 및 파싱
+        decoded = response.content.decode("utf-8")
+        rows = parse_csv_result(decoded)
+        return rows
     except Exception as e:
         print(f"[InfluxDB] Query failed: {e}")
-        return []
+        return None
 
 def set_redis_data(key: str, value):
     if not redis_client:
@@ -345,6 +350,13 @@ def is_connected_redis():
 
 # --- 초기화 ---
 def initialize_services():
+    print("[services] ⏳ Connecting to services...")
+    connect_mqtt()
+    print("[services] ✅ MQTT connected (or tried)")
+    connect_influxdb()
+    print("[services] ✅ InfluxDB connected (or tried)")
+    connect_redis()
+    print("[services] ✅ Redis connected (or tried)")
     print("\n--- Initializing Backend Services ---")
     for name in ("connect_mqtt", "connect_influxdb", "connect_redis"):
         func = globals().get(name, None)
@@ -357,3 +369,25 @@ def initialize_services():
         else:
             print(f"{name} not defined — skipping")
     print("--- All services connection attempts made. ---\n")
+
+def get_influx_client():
+    return influxdb_client
+
+__all__ = [
+    "connect_influxdb",
+    "query_influxdb_data",
+    "write_sensor_data_to_influxdb",
+    "get_influx_client",
+]
+
+def parse_csv_result(decoded_csv: str):
+    """
+    InfluxDB의 CSV 응답을 파싱해서 list[dict] 형태로 변환
+    """
+    f = StringIO(decoded_csv)
+    reader = csv.DictReader(f)
+    rows = []
+    for row in reader:
+        if row.get("_time"):  # 빈 행 제거
+            rows.append(row)
+    return rows
