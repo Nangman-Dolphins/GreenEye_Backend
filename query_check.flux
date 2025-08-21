@@ -1,5 +1,0 @@
-from(bucket: "sensor_data")
-  |> range(start: -1h)
-  |> filter(fn: (r) => r._measurement == "sensor_readings")
-  |> keep(columns: ["_time", "device_id", "mac_address", "_field", "_value"])
-  |> limit(n: 10)

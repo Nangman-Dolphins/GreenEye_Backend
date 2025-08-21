@@ -1,56 +1,42 @@
-# === Environment secrets ===
-.env
-.env.local
-.env.docker
-.env.*
-!.env.example
-
-# === Python build/cache ===
+# --- Python ---
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-*.so
-*.egg-info/
-.eggs/
-*.spec
+*.pyd
+*.log
 
-# === Virtual envs ===
+# --- Virtualenv ---
 .venv/
 venv/
 env/
 
-# === Logs / temp ===
-*.log
-logs/
-tmp/
-.cache/
-.profile
+# --- IDE / Editor ---
+.vscode/
+.idea/
 
-# === Databases / state ===
-*.db
-*.db-*
-*.sqlite3
-*.sqlite
-greeneye_users.db
-
-# === Generated artifacts ===
-images/
-reports/
-output/
-dist/
-build/
-
-# === OS / IDE ===
+# --- OS files ---
 .DS_Store
 Thumbs.db
-.idea/
-.vscode/
-*.code-workspace
 
-# === Keys / certs ===
-*.pem
-*.key
-*.crt
+# --- SQLite databases ---
+/data/*.db
+/data/*.db-wal
+/data/*.db-shm
 
-# === Docker (local overrides) ===
-docker-compose.override.yml
+# --- Secrets & Environment ---
+.env
+.env.local
+.env.docker
+
+# --- Docker ---
+*.pid
+*.sock
+*.log
+
+# --- Reports / Generated files ---
+/reports/*
+!reports/.gitkeep
+
+# --- Test / Debug files (optional) ---
+/archive/*
+/queries/*

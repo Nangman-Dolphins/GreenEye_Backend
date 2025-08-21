@@ -1,5 +1,0 @@
-from(bucket: "sensor_data")
-  |> range(start: -2h)
-  |> filter(fn: (r) => r["_measurement"] == "sensor_readings")
-  |> filter(fn: (r) => r["device_id"] == "eef1")
-  |> limit(n: 5)
