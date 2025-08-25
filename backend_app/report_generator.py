@@ -20,8 +20,8 @@ from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
 from dotenv import load_dotenv
-from services import connect_influxdb, query_influxdb_data
-from database import get_all_devices, get_all_users
+from .services import connect_influxdb, query_influxdb_data
+from .database import get_all_devices, get_all_users
 from pathlib import Path
 
 load_dotenv()

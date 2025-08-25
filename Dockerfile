@@ -24,4 +24,4 @@ EXPOSE 5000
 # 컨테이너 시작 시 실행될 명령어
 # Flask 앱을 Gunicorn이라는 프로덕션용 WSGI 서버로 실행합니다.
 # 워커(worker)는 2개로 설정하며, 호스트 0.0.0.0의 5000번 포트에서 실행합니다.
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:5000", "wsgi:app"]
+CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:5000", "backend_app.wsgi:app"]
