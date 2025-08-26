@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
+from .chat_database import init_chat_db, save_message, load_history, get_user_conversations
+
 from .services import (
     initialize_services,
     mqtt_client,
@@ -289,6 +291,10 @@ def init_runtime_and_scheduler():
         print("[init] ⏳ init_db()...")
         init_db()
         print("[init] ✅ init_db() done")
+
+        print("[init] ⏳ init_chat_db()...")
+        init_chat_db()
+        print("[init] ✅ init_chat_db() done")
 
         scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
 
@@ -715,6 +721,137 @@ def put_alert_thresholds():
                     th[key][k] = body[key][k]
     _save_thresholds(th)
     return jsonify(th)
+
+# --- Gemini API 관련 설정 ---
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+@app.route('/api/chat/gemini', methods=['POST'])
+@token_required
+def chat_with_gemini():
+    """
+    Gemini AI와 대화하는 엔드포인트
+    - prompt: 사용자의 질문/메시지
+    - image: (선택) base64로 인코딩된 이미지
+    - conversation_id: (선택) 대화 식별자. 없으면 새로 생성
+    """
+    try:
+        data = request.get_json()
+        if not data or 'prompt' not in data:
+            return jsonify({"error": "메시지를 입력해주세요."}), 400
+
+        user_prompt = data.get('prompt')
+        image_base64 = data.get('image')
+        conversation_id = data.get('conversation_id', str(uuid.uuid4()))
+        current_user_id = g.current_user['id']
+
+        # 사용자 메시지 저장
+        save_message(conversation_id, current_user_id, 'user', user_prompt)
+        
+        # 이전 대화 기록 불러오기
+        chat_history = load_history(conversation_id, current_user_id)
+        
+        # 현재 메시지 준비
+        current_user_parts = [{"text": user_prompt}]
+        if image_base64:
+            current_user_parts.append({
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": image_base64
+                }
+            })
+
+        # 전체 대화 내용 준비
+        contents = []
+        for role, content in chat_history:
+            contents.append({"role": role, "parts": [{"text": content}]})
+        contents.append({"role": "user", "parts": current_user_parts})
+        
+        # API 요청 준비
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.7,
+                "topK": 1,
+                "topP": 1
+            }
+        }
+        
+        headers = {
+            'Content-Type': 'application/json'
+        }
+
+        # Gemini API 호출
+        response = requests.post(GEMINI_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # 응답 처리
+        gemini_response = response.json()
+        if 'candidates' not in gemini_response or not gemini_response['candidates']:
+            raise Exception("응답에 candidates가 없습니다.")
+            
+        answer = gemini_response['candidates'][0]['content']['parts'][0]['text']
+
+        # AI 응답 저장
+        save_message(conversation_id, current_user_id, 'model', answer)
+
+        return jsonify({
+            "answer": answer,
+            "conversation_id": conversation_id
+        })
+
+    except Exception as e:
+        print(f"Gemini API 에러: {str(e)}")
+        return jsonify({"error": f"AI 응답을 받아오는데 실패했습니다: {str(e)}"}), 500
+
+@app.route('/api/chat/history', methods=['GET'])
+@token_required
+def get_chat_history():
+    """
+    사용자의 대화 기록을 조회하는 엔드포인트
+    - conversation_id: (선택) 특정 대화의 기록을 조회. 없으면 모든 대화 목록 반환
+    """
+    try:
+        current_user_id = g.current_user['id']
+        conversation_id = request.args.get('conversation_id')
+        
+        if conversation_id:
+            # 특정 대화의 전체 메시지 조회
+            messages = load_history(conversation_id, current_user_id)
+            if not messages:
+                return jsonify({
+                    "conversation_id": conversation_id,
+                    "messages": [],
+                    "message": "해당 대화의 기록이 없습니다."
+                })
+            return jsonify({
+                "conversation_id": conversation_id,
+                "messages": [
+                    {"role": role, "content": content}
+                    for role, content in messages
+                ]
+            })
+        else:
+            # 모든 대화 목록 조회
+            conversations = get_user_conversations(current_user_id)
+            if not conversations:
+                return jsonify({
+                    "conversations": [],
+                    "message": "대화 기록이 없습니다."
+                })
+            return jsonify({
+                "conversations": [
+                    {
+                        "id": conv_id,
+                        "last_update": last_update
+                    }
+                    for conv_id, last_update in conversations
+                ]
+            })
+    except Exception as e:
+        print(f"대화 기록 조회 에러: {str(e)}")
+        return jsonify({"error": "대화 기록을 불러오는데 실패했습니다."}), 500
+
 
 if __name__ == "__main__":
     with app.app_context():
