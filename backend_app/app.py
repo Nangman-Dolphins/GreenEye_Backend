@@ -726,47 +726,77 @@ def put_alert_thresholds():
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
+# base64 이미지 예시
+#{
+#    "prompt": "이 이미지에 대해 설명해주세요",
+#    "image": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
+#}
+# hex 이미지 예시
+#{
+#    "prompt": "이 이미지에 대해 설명해주세요",
+#    "image": "0xFFD8FFE000104A46494600010101006000600000FFDB00430008060607060508..."
+#}
+
+def hex_to_base64(hex_string):
+    """
+    HEX 문자열을 BASE64로 변환
+    """
+    try:
+        # HEX 문자열에서 '0x' 또는 '#' 제거
+        hex_string = hex_string.replace('0x', '').replace('#', '')
+        # HEX를 바이트로 변환
+        bytes_data = bytes.fromhex(hex_string)
+        # 바이트를 BASE64로 인코딩
+        base64_data = base64.b64encode(bytes_data).decode('utf-8')
+        return base64_data
+    except Exception as e:
+        print(f"HEX to BASE64 변환 에러: {str(e)}")
+        return None
+
 @app.route('/api/chat/gemini', methods=['POST'])
 @token_required
 def chat_with_gemini():
-    """
-    Gemini AI와 대화하는 엔드포인트
-    - prompt: 사용자의 질문/메시지
-    - image: (선택) base64로 인코딩된 이미지
-    - conversation_id: (선택) 대화 식별자. 없으면 새로 생성
-    """
     try:
         data = request.get_json()
         if not data or 'prompt' not in data:
             return jsonify({"error": "메시지를 입력해주세요."}), 400
 
         user_prompt = data.get('prompt')
-        image_base64 = data.get('image')
+        image_data = data.get('image')
         conversation_id = data.get('conversation_id', str(uuid.uuid4()))
         current_user_id = g.current_user['id']
 
-        # 사용자 메시지 저장
+        # --- 이미지 데이터 처리 (이 부분은 동일) ---
+        image_base64 = None
+        if image_data:
+            if isinstance(image_data, str):
+                if image_data.startswith('data:image'):
+                    image_base64 = image_data.split(',')[1] if ',' in image_data else image_data
+                else:
+                    image_base64 = hex_to_base64(image_data)
+
+        # 1. 사용자 메시지를 DB에 저장합니다.
         save_message(conversation_id, current_user_id, 'user', user_prompt)
         
-        # 이전 대화 기록 불러오기
+        # 2. 방금 저장한 메시지를 포함한 '전체' 대화 기록을 불러옵니다.
         chat_history = load_history(conversation_id, current_user_id)
         
-        # 현재 메시지 준비
-        current_user_parts = [{"text": user_prompt}]
-        if image_base64:
-            current_user_parts.append({
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": image_base64
-                }
-            })
-
-        # 전체 대화 내용 준비
+        # 3. '전체' 대화 기록을 Gemini API 형식으로 변환합니다.
         contents = []
-        for role, content in chat_history:
-            contents.append({"role": role, "parts": [{"text": content}]})
-        contents.append({"role": "user", "parts": current_user_parts})
-        
+        for i, (sender, message) in enumerate(chat_history):
+            role = 'user' if sender == 'user' else 'model'
+            
+            # 마지막 메시지(현재 사용자 메시지)에만 이미지를 추가합니다.
+            if i == len(chat_history) - 1 and image_base64:
+                parts = [
+                    {"text": message},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}
+                ]
+            else:
+                parts = [{"text": message}]
+            
+            contents.append({"role": role, "parts": parts})
+
         # API 요청 준비
         payload = {
             "contents": contents,
@@ -777,32 +807,29 @@ def chat_with_gemini():
             }
         }
         
-        headers = {
-            'Content-Type': 'application/json'
-        }
+        headers = {'Content-Type': 'application/json'}
 
-        # Gemini API 호출
+        # Gemini API 호출 및 응답 처리 (이하 동일)
         response = requests.post(GEMINI_API_URL, headers=headers, json=payload)
         response.raise_for_status()
         
-        # 응답 처리
         gemini_response = response.json()
         if 'candidates' not in gemini_response or not gemini_response['candidates']:
             raise Exception("응답에 candidates가 없습니다.")
             
         answer = gemini_response['candidates'][0]['content']['parts'][0]['text']
 
-        # AI 응답 저장
         save_message(conversation_id, current_user_id, 'model', answer)
 
         return jsonify({
             "answer": answer,
-            "conversation_id": conversation_id
+            "conversation_id": conversation_id,
         })
 
     except Exception as e:
         print(f"Gemini API 에러: {str(e)}")
         return jsonify({"error": f"AI 응답을 받아오는데 실패했습니다: {str(e)}"}), 500
+
 
 @app.route('/api/chat/history', methods=['GET'])
 @token_required
