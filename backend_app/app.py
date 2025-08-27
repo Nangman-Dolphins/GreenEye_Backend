@@ -1,4 +1,4 @@
-import os
+import os, secrets
 import json
 import uuid
 import pytz
@@ -7,6 +7,11 @@ from urllib.parse import urlparse
 import base64
 import requests
 import jwt
+import re
+from functools import wraps
+from threading import Lock
+
+from flask_cors import CORS
 
 from flask import Flask, jsonify, request, send_from_directory, g
 from flask_socketio import SocketIO, emit
@@ -14,7 +19,7 @@ from dotenv import load_dotenv
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from services import (
+from .services import (
     initialize_services,
     mqtt_client,
     get_redis_data,
@@ -27,36 +32,48 @@ from services import (
     send_mode_to_device
 )
 
-from database import (
+from .database import (
     init_db,
     add_user,
     get_user_by_email,
     check_password,
     add_device,
-    get_device_by_friendly_name,
-    get_all_devices,
-    get_device_by_device_id
+    get_device_by_device_id,        
+    get_device_by_device_id_any,               
+    get_all_devices,             # (유저별 조회용)
+    get_all_devices_any,         # (전체 조회용) 여기! 수정함!!    
 )
-from control_logic import (
+
+from backend_app.control_logic import (
     handle_manual_control,
     check_and_apply_auto_control
 )
-from report_generator import send_all_reports
+from backend_app.report_generator import send_all_reports
 
 load_dotenv()
 app = Flask(__name__)
+
+ENV = os.getenv("FLASK_ENV", "production").lower()
+SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY")
+if not SECRET_KEY:
+    if ENV in ("development", "dev", "debug"):
+        # 개발 환경: 임시 키 허용(로그로만 알림)
+        SECRET_KEY = secrets.token_urlsafe(32)
+        print("[warn] SECRET_KEY not set; generated a dev-only key.")
+    else:
+        raise RuntimeError("SECRET_KEY is not set (production)")
+app.config["SECRET_KEY"] = SECRET_KEY
+
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-initialize_services()
-
-from functools import wraps
-from threading import Lock
-from flask import request  # ← 추가
+CORS(app, resources={r"/api/*": {
+    "origins": ["http://localhost:5173", "http://localhost:3000"]
+}})
 
 if not hasattr(app, "before_first_request"):
     _run_once_lock = Lock()
     _run_once_flag = {"done": False}
-    _health_skip_paths = {"/healthz", "/health"}  # 필요하면 "/"도 추가 가능
+    _health_skip_paths = {"/healthz", "/health", "/api/healthz", "/api/health"}
 
     def _before_first_request_decorator(func):
         @wraps(func)
@@ -81,18 +98,162 @@ if not hasattr(app, "before_first_request"):
 
     app.before_first_request = _before_first_request_decorator
 
-IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), "images")
-INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
+from werkzeug.utils import secure_filename
 
+# === App-level constants & helper bindings ===
+IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), "images")
+ALLOWED_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp"}
+DEFAULT_SHARED_PREFIXES = {"default_", "common_"}  # 공용 이미지 삭제 방지 접두사
+os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
+
+def _allowed_ext(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTS
+
+def _save_device_image(file_storage, device_id: str) -> str | None:
+    """
+    업로드된 이미지를 device_id 기반 단일 파일로 저장하고,
+    DB에 넣을 상대경로('images/<filename>')를 반환한다.
+    """
+    if not file_storage or not file_storage.filename.strip():
+        return None
+    fname = secure_filename(file_storage.filename)
+    if not _allowed_ext(fname):
+        raise ValueError("Unsupported file type")
+    ext = fname.rsplit(".", 1)[1].lower()
+    out_name = f"{device_id}.{ext}"
+    abs_path = os.path.join(IMAGE_UPLOAD_FOLDER, out_name)
+    file_storage.save(abs_path)
+    return f"images/{out_name}"
+
+def _is_shared_image(rel_path: str) -> bool:
+    try:
+        base = os.path.basename(rel_path)
+        return any(base.startswith(px) for px in DEFAULT_SHARED_PREFIXES)
+    except Exception:
+        return False
+
+def _delete_device_image(rel_path: str) -> bool:
+    """
+    DB에 저장된 상대경로('images/<file>')를 실제 경로로 변환하여 삭제.
+    공용 접두사 이미지는 건너뜀.
+    """
+    if not rel_path or _is_shared_image(rel_path):
+        return False
+    base = os.path.basename(rel_path)  # 안전
+    abs_path = os.path.join(IMAGE_UPLOAD_FOLDER, base)
+    if os.path.exists(abs_path):
+        os.remove(abs_path)
+        return True
+    return False
+
+def _delete_all_images_for_device(device_id: str) -> int:
+    """
+    확장자가 달라질 수 있으니 device_id.* 패턴을 모두 정리한다.
+    반환값: 삭제한 파일 개수
+    """
+    import glob
+    removed = 0
+    pattern = os.path.join(IMAGE_UPLOAD_FOLDER, f"{device_id}.*")
+    for path in glob.glob(pattern):
+        base = os.path.basename(path)
+        if any(base.startswith(px) for px in DEFAULT_SHARED_PREFIXES):
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+# Influx 기본 설정 (측정명 기본값 보강!)
+INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
+INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "sensor_readings")
+
+DEVICE_PREFIX = os.getenv("DEVICE_PREFIX", "ge-sd")
+
+def normalize_device_id(raw: str) -> str:
+    """
+    'ge-sd-6c18' 같은 입력을 내부용 짧은 ID '6c18'으로 변환.
+    이미 '6c18'이면 그대로 반환.
+    """
+    if not raw:
+        return raw
+    r = raw.strip().lower()
+    m = re.fullmatch(rf"{DEVICE_PREFIX}-([0-9a-f]{{4}})", r)
+    return m.group(1) if m else r
+
+def to_device_code(short_id: str) -> str:
+    """
+    짧은 ID '6c18' -> 'ge-sd-6c18' 으로 표시용 코드 변환.
+    """
+    sid = (short_id or "").strip().lower()
+    return f"{DEVICE_PREFIX}-{sid}" if re.fullmatch(r"[0-9a-f]{4}", sid) else short_id
+
+def _to_device_id_from_any(s: str) -> str:
+    """MAC(aa:bb:...) / ge-sd-XXXX / 그냥 XXXX 모두에서 마지막 4자리로 device_id 생성"""
+    if not s:
+        return ""
+    t = s.strip()
+    if t.lower().startswith("ge-sd-"):
+        t = t.split("-", 2)[-1]  # 'ge-sd-' 뒤쪽
+    t = t.replace(":", "").replace("-", "")
+    return t[-4:].lower()
+
+def _normalize_mac_like(s: str) -> str:
+    """
+    저장용 mac_address 표준화:
+    - 'ge-sd-XXXX' 형태면 그대로 대문자 접미부로 보정
+    - 일반 MAC이면 콜론 포함 대문자
+    - 4~6글자 같은 짧은 식별자면 'ge-sd-XXXX'로 만들어 저장
+    """
+    if not s:
+        return s
+    t = s.strip()
+    if t.lower().startswith("ge-sd-"):
+        suf = t.split("-", 2)[-1]
+        suf = "".join(ch for ch in suf if ch.isalnum())[-4:].upper()
+        return f"{DEVICE_PREFIX}{suf}"
+    if ":" in t:  # 풀 MAC
+        return t.upper()
+    # 짧은 식별자(마지막 4자리만 넘겨온 경우 등)
+    suf = "".join(ch for ch in t if ch.isalnum())[-4:].upper()
+    return f"{DEVICE_PREFIX}{suf}"
+
+# Alert thresholds 파일 경로 + 기본값 (경고 임계치 API가 필요하다면)
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+TH_FILE = os.path.join(DATA_DIR, "alert_thresholds.json")
+DEFAULT_TH = {
+    "temperature": {"min": 10, "max": 35},
+    "humidity": {"min": 30, "max": 85},
+    "soil_moisture": {"min": 40, "max": 90},
+}
+
+# Redis 키/헬퍼
+def _redis_key_latest_sensor(device_id: str) -> str:
+    return f"latest_sensor_data:{device_id}"
+
+def _redis_key_latest_ai(device_id: str) -> str:
+    return f"latest_ai_diagnosis:{device_id}"
+
+def get_latest_sensor_data_from_redis(device_id: str):
+    return get_redis_data(_redis_key_latest_sensor(device_id)) or None
+
+def get_latest_ai_from_redis(device_id: str):
+    return get_redis_data(_redis_key_latest_ai(device_id)) or None
+
+# DB에서 친화 이름 조회
+def get_friendly_name(device_id: str) -> str:
+    dev = get_device_by_device_id_any(device_id)
+    return (dev and dev.get("friendly_name")) or device_id
 
 def token_required(f):
+    @wraps(f) 
     def decorated(*args, **kwargs):
         token = request.headers.get("Authorization")
         if not token or not token.startswith("Bearer "):
             return jsonify({"message": "Token is missing!"}), 401
-        
+
         token = token.split(" ")[1]
-        
         try:
             data = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
             g.current_user = get_user_by_email(data["email"])
@@ -131,8 +292,9 @@ def init_runtime_and_scheduler():
 
         scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
 
-        print("[init] ⏳ get_all_devices()...")
-        devices = get_all_devices()
+        #여기! 수정함!!
+        print("[init] ⏳ get_all_devices_any()...")
+        devices = get_all_devices_any()
         print(f"[init] ✅ Found {len(devices)} device(s) in DB")
 
         if not devices:
@@ -165,7 +327,7 @@ def home():
     return "Hello, GreenEye Backend is running!"
 
 @app.get("/healthz")
-@app.get("/health")
+@app.get("/api/healthz")
 def healthz():
     return {"status": "ok"}, 200
 
@@ -173,7 +335,7 @@ def healthz():
 def status():
     return jsonify({"status": "ok", "message": "Backend API is working!"})
 
-@app.route("/api/health")
+@app.get("/api/health")
 def health():
     return jsonify({
         "api": "ok",
@@ -182,46 +344,124 @@ def health():
         "redis": "ok" if is_connected_redis() else "down",
     })
 
+@app.get("/health")
+def root_health():
+    return health()
+
 @app.route("/api/latest_sensor_data/<device_id>")
-def get_latest_sensor_data(device_id: str):
-    dev = get_device_by_device_id(device_id)
+@token_required
+def api_latest_sensor_data(device_id):
+    device_id = normalize_device_id(device_id)
+    owner_user_id = g.current_user["id"]
+
+    # ✅ 이 유저의 장치인지 확인
+    dev = get_device_by_device_id(device_id, owner_user_id)
     if not dev:
-        return jsonify({"error": "Device not found"}), 404
-    data = get_redis_data(f"latest_sensor_data:{device_id}")
-    ai_diagnosis = get_redis_data(f"latest_ai_diagnosis:{device_id}")
+        return jsonify({"error":"Device not found"}), 404
+
+    # Redis → Influx 폴백은 기존 로직 그대로
+    data = get_latest_sensor_data_from_redis(device_id)
+    ai   = get_latest_ai_from_redis(device_id)
     if not data:
         return jsonify({"error": "No data found"}), 404
-    if ai_diagnosis:
-        data["ai_diagnosis"] = ai_diagnosis
+
     data["friendly_name"] = dev["friendly_name"]
+    if ai:
+        data["ai_diagnosis"] = ai
     return jsonify(data)
 
+def _to_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+def _normalize_latest_row(d):
+    # Redis/Influx/내부 dict 키가 섞여 있을 때 timestamp 키만 맞춰줌
+    t = d.get("timestamp") or d.get("_time") or d.get("time")
+    d["timestamp"] = t
+    return d
+
+def build_device_code(prefix: str, device_id: str) -> str:
+    """prefix와 device_id를 안전하게 결합하여 'prefix-device_id' 형태로 반환.
+    - prefix 양끝의 하이픈 제거
+    - 빈 조각은 제외
+    - 최종 문자열 내 연속 하이픈을 한 개로 축약
+    """
+    p = (prefix or "").strip().strip("-")
+    d = (device_id or "").strip().lower()
+    parts = [x for x in [p, d] if x]           # 빈 값 제거
+    s = "-".join(parts)
+    return re.sub(r"-+", "-", s)               # 연속 하이픈 축약
+
+def _rget(row, key, default=None):
+    """sqlite3.Row 또는 dict 모두에서 안전하게 키를 꺼낸다."""
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except Exception:
+        return default
+
 @app.route("/api/historical_sensor_data/<device_id>")
+@token_required
 def get_historical_sensor_data(device_id: str):
-    dev = get_device_by_device_id(device_id)
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
     if not dev:
         return jsonify({"error": "Device not found"}), 404
-    query = f'''
+
+    flux_pivot = f'''
     from(bucket: "{INFLUXDB_BUCKET}")
       |> range(start: -7d)
-      |> filter(fn: (r) => r._measurement == "sensor_readings")
+      |> filter(fn: (r) => r._measurement == "{INFLUX_MEASUREMENT}")
       |> filter(fn: (r) => r.device_id == "{device_id}")
       |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
       |> keep(columns: ["_time","device_id","temperature","humidity","light_lux","soil_moisture","soil_ec","soil_temp","battery"])
+      |> rename(columns: {{_time: "time"}})
+      |> sort(columns: ["time"])
     '''
-    data = query_influxdb_data(query)
+    data = query_influxdb_data(flux_pivot) or []
+    print(f"[DEBUG] api/historical -> device={device_id} rows={len(data)}")
+    if not data:
+        # --- 폴백: pivot 없이 raw 50개만 확인 ---
+        flux_raw = f'''
+        from(bucket: "{INFLUXDB_BUCKET}")
+          |> range(start: -7d)
+          |> filter(fn: (r) => r._measurement == "{INFLUX_MEASUREMENT}")
+          |> filter(fn: (r) => r.device_id == "{device_id}")
+          |> keep(columns: ["_time","_field","_value","device_id"])
+          |> sort(columns: ["_time"])
+          |> limit(n: 50)
+        '''
+        raw = query_influxdb_data(flux_raw) or []
+        # raw를 time 기준으로 필드 병합 (간단 버전)
+        by_time = {}
+        for r in raw:
+            t = r.get("_time")
+            if not t:
+                continue
+            d = by_time.setdefault(t, {"time": t, "device_id": r.get("device_id")})
+            fld = r.get("_field")
+            val = r.get("_value")
+            if fld:
+                d[fld] = (float(val) if isinstance(val, str) and val.replace('.','',1).isdigit() else val)
+        data = list(by_time.values())
+        data.sort(key=lambda x: x.get("time"))
+
+    # friendly_name 부여
     for row in data:
         row["friendly_name"] = dev["friendly_name"]
+
     return jsonify(data)
 
 @app.route("/api/control_device/<device_id>", methods=["POST"])
+@token_required
 def control_device(device_id: str):
-    if not request.is_json:
-        return jsonify({"error": "Request must be JSON"}), 400
-
-    dev = get_device_by_device_id(device_id)
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
     if not dev:
-        return jsonify({"error": "Device not found"}), 404
+        return jsonify({"error":"Device not found"}), 404
 
     config_data = request.get_json()
     if not config_data:
@@ -230,22 +470,26 @@ def control_device(device_id: str):
     send_config_to_device(device_id, config_data)
     return jsonify({"status": "success", "message": f"Configuration sent to {device_id}"})
 
+# 변경(보안/소유자 확인 추가)
 @app.route("/api/control_mode/<device_id>", methods=["POST"])
+@token_required
 def control_device_by_mode(device_id: str):
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
+    if not dev:
+        return jsonify({"error":"Device not found"}), 404
+
     data = request.get_json(silent=True) or {}
     mode = data.get("mode")
     if not mode:
         return jsonify({"error": "Missing 'mode' in request body"}), 400
+
     try:
         config = send_mode_to_device(device_id, mode)
-        return jsonify({
-            "status": "success",
-            "device_id": device_id,
-            "mode": mode,
-            "applied_config": config
-        })
+        return jsonify({"status": "success", "device_id": device_id, "mode": mode, "applied_config": config})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+
 
 @app.route("/api/auth/register", methods=["POST"])
 def register_user():
@@ -277,29 +521,88 @@ def login_user():
     else:
         return jsonify({"error": "Invalid email or password"}), 401
 
-from werkzeug.utils import secure_filename  # get_image에서 사용
-
 @app.route("/api/register_device", methods=["POST"])
+@token_required
 def register_device():
     try:
-        if not request.is_json:
-            return jsonify({"error": "Request must be JSON"}), 400
+        device_image_path = None
+        room = ""
+        species = ""
 
-        data = request.get_json(silent=True) or {}
-        mac = data.get("mac_address")
-        friendly_name = data.get("friendly_name")
-        if not mac or not friendly_name:
-            return jsonify({"error": "mac_address and friendly_name are required"}), 400
+        if request.content_type and "multipart/form-data" in request.content_type:
+            mac = request.form.get("mac_address")
+            friendly_name = request.form.get("friendly_name")
+            room = request.form.get("room") or ""
+            species = request.form.get("species") or ""
+            if not mac or not friendly_name:
+                return jsonify({"error": "mac_address and friendly_name are required"}), 400
+        else:
+            if not request.is_json:
+                return jsonify({"error": "Request must be JSON"}), 400
+            data = request.get_json(silent=True) or {}
+            mac = data.get("mac_address")
+            friendly_name = data.get("friendly_name")
+            room = data.get("room") or ""
+            species = data.get("species") or ""
+            if not mac or not friendly_name:
+                return jsonify({"error": "mac_address and friendly_name are required"}), 400
+
+            # base64 이미지는 일단 파싱만(저장은 device_id 계산 후)
+            pending_b64 = None
+            image_base64 = data.get("image_base64")
+            if image_base64:
+                header, b64data = image_base64.split(",", 1) if "," in image_base64 else ("", image_base64)
+                pending_b64 = b64data
+
+        mac = mac.strip()
+        if not re.fullmatch(r"[A-Za-z0-9]{2}-[A-Za-z0-9]{2}-[0-9a-fA-F]{4}", mac) and \
+            not re.fullmatch(r"ge-sd-[0-9a-fA-F]{4}", mac.lower()):
+            return jsonify({"error":"mac_address must match 'ge-sd-0000' (4 hex)"}), 400
 
         mac_norm = mac.upper()
-        device_id = mac_norm.replace(":", "").lower()[-4:]
+        device_id = mac_norm.split("-")[-1].lower()
+        owner_user_id = g.current_user["id"]
 
-        created = add_device(mac_norm, friendly_name)  # add_device는 인자 2개
-
+        # ✅ 유효성 검사 통과 후에만 파일 저장 (multipart)
+        if request.content_type and "multipart/form-data" in request.content_type:
+            file = request.files.get("image")
+            if file and file.filename:
+                try:
+                    device_image_path = _save_device_image(file, device_id)
+                except ValueError as e:
+                    return jsonify({"error": str(e)}), 400
+                
+        # ✅ JSON base64 저장도 여기서(device_id 확보 후)
+        elif 'pending_b64' in locals() and pending_b64:
+            try:
+                img_bytes = base64.b64decode(pending_b64)
+                filename = f"{device_id}.png"
+                save_path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
+                with open(save_path, "wb") as f:
+                    f.write(img_bytes)
+                device_image_path = f"images/{filename}"
+            except Exception as e:
+                return jsonify({"error": f"Invalid base64 image: {e}"}), 400
+        
+        created = add_device(
+            mac_norm,
+            friendly_name,
+            owner_user_id,
+            device_image=device_image_path,
+            plant_type=species,
+            room=room
+        )
         if created:
-            return jsonify({"message": "registered", "mac_address": mac_norm, "device_id": device_id}), 201
+            return jsonify({
+                "message":"registered",
+                "mac_address": mac_norm,
+                "device_id": device_id,
+                "device_image": device_image_path,
+                "plant_type": species,
+                "room": room
+            }), 201
         else:
-            return jsonify({"error": "Device already exists", "mac_address": mac_norm, "device_id": device_id}), 409
+            return jsonify({"error":"Device already exists","mac_address": mac_norm,"device_id": device_id}), 409
 
     except Exception as e:
         import traceback
@@ -307,21 +610,148 @@ def register_device():
         return jsonify({"error": "internal_error", "detail": str(e)}), 500
 
 @app.route("/api/images/<device_id>/<filename>")
+@token_required
 def get_image(device_id: str, filename: str):
-    dev = get_device_by_device_id(device_id)
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
     if not dev:
         return jsonify({"error": "Device not found"}), 404
     safe_filename = secure_filename(filename)
     return send_from_directory(IMAGE_UPLOAD_FOLDER, safe_filename)
 
-# ✅ 이 위치에서 Gunicorn 실행 시만 초기화 실행
-if __name__ != "__main__":
-    print("🧪 [DEBUG] entered '__name__ != __main__' block")  # 🔍 이 줄이 로그에 보여야 함
-    init_runtime_and_scheduler()
-    print("🧪 [DEBUG] called init_runtime_and_scheduler()")
-    app.logger.info("✅ init_runtime_and_scheduler() 실행됨 (Gunicorn 포함)")
+
+@app.route("/api/devices", methods=["GET"])
+@token_required
+def list_devices():
+    owner_user_id = g.current_user["id"]
+    # DB 기준으로 이 유저의 장치 목록
+    devices = get_all_devices(owner_user_id) or []
+    return jsonify(devices)
+
+@app.route("/api/devices/<device_id>/image", methods=["POST"])
+@token_required
+def upload_device_image(device_id: str):
+    """
+    기존 디바이스에 대표 이미지를 추가/교체한다 (multipart/form-data, key: image).
+    - 교체 시 기존 device_id.* 파일들을 먼저 정리한 뒤 새 파일을 저장.
+    """
+    from backend_app.database import get_device_by_device_id, update_device_image
+
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
+    if not dev:
+        return jsonify({"error": "Device not found"}), 404
+
+    if not (request.content_type and "multipart/form-data" in request.content_type):
+        return jsonify({"error": "Content-Type must be multipart/form-data"}), 400
+
+    file = request.files.get("image")
+    if not file or not file.filename:
+        return jsonify({"error": "Missing file 'image'"}), 400
+
+    # 기존 파일들 정리(확장자 바뀌는 경우 대비)
+    _delete_all_images_for_device(device_id)
+    # 새 파일 저장
+    try:
+        rel_path = _save_device_image(file, device_id)  # images/<device_id>.<ext>
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    ok = update_device_image(device_id, owner_user_id, rel_path)
+    if not ok:
+        return jsonify({"error": "Failed to update device image"}), 500
+    return jsonify({"message": "image_updated", "device_id": device_id, "device_image": rel_path}), 200
+
+@app.route("/api/devices/<device_id>/image", methods=["DELETE"])
+@token_required
+def delete_device_image(device_id: str):
+    """
+    대표 이미지를 제거한다(파일 삭제 + DB 경로 NULL).
+    """
+    from backend_app.database import get_device_by_device_id, update_device_image
+
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
+    if not dev:
+        return jsonify({"error": "Device not found"}), 404
+
+    removed_files = 0
+    rel = dev.get("device_image")
+    if rel:
+        # 정확히 저장된 경로 제거 + 혹시 남아있을 확장자 변형도 제거
+        _delete_device_image(rel)
+        removed_files += _delete_all_images_for_device(device_id)
+
+    ok = update_device_image(device_id, owner_user_id, None)
+    if not ok:
+        return jsonify({"error": "Failed to clear device image"}), 500
+    return jsonify({"message": "image_deleted", "device_id": device_id, "removed_files": removed_files}), 200
+
+@app.route("/api/devices/<device_id>", methods=["DELETE"])
+@token_required
+def delete_device(device_id: str):
+    """
+    디바이스 삭제: 소유자 검증 → (있다면) 대표 이미지 삭제 → DB 레코드 삭제
+    """
+    from backend_app.database import get_device_by_device_id, delete_device_from_db
+
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
+    if not dev:
+        return jsonify({"error": "Device not found"}), 404
+
+    removed = False
+    rel = dev.get("device_image")
+    if rel:
+        removed = _delete_device_image(rel)
+
+    ok = delete_device_from_db(device_id, owner_user_id)
+    if not ok:
+        # 이론상 여기 도달하지 않음(위의 fetch로 존재 확인을 했기 때문)
+        return jsonify({"error": "Failed to delete device"}), 500
+
+    return jsonify({
+        "message": "Device deleted",
+        "image_removed": bool(removed),
+        "skipped_shared": _is_shared_image(rel) if rel else False
+    }), 200
+
+def _load_thresholds():
+    try:
+        with open(TH_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT_TH.copy()
+
+def _save_thresholds(obj):
+    os.makedirs(os.path.dirname(TH_FILE), exist_ok=True)
+    with open(TH_FILE, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+@app.route("/api/alert_thresholds", methods=["GET"])
+def get_alert_thresholds():
+    return jsonify(_load_thresholds())
+
+@app.route("/api/alert_thresholds", methods=["PUT"])
+def put_alert_thresholds():
+    body = request.get_json(force=True, silent=True) or {}
+    th = _load_thresholds()
+    # 부분 업데이트 허용
+    for key in ["temperature", "humidity", "soil_moisture"]:
+        if key in body and isinstance(body[key], dict):
+            th.setdefault(key, {})
+            for k in ["min","max"]:
+                if k in body[key]:
+                    th[key][k] = body[key][k]
+    _save_thresholds(th)
+    return jsonify(th)
 
 if __name__ == "__main__":
     with app.app_context():
         init_runtime_and_scheduler()
-    socketio.run(app, debug=os.getenv("FLASK_DEBUG", "0") == "1", host="0.0.0.0", port=5000)
+    socketio.run(
+        app,
+        debug=os.getenv("FLASK_DEBUG", "0") == "1",
+        host="0.0.0.0",
+        port=8000,  # ← 5000 → 8000
+    )
