@@ -14,7 +14,7 @@ from io import StringIO
 
 from .database import get_db_connection, get_device_by_device_id_any
 
-from .ai_inference import run_inference_on_image
+from .inference import model_manager
 
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=".env", override=False)
@@ -319,6 +319,62 @@ def get_redis_data(key: str):
         print(f"Error getting data from Redis: {e}")
         return None
 
+# === 추론 함수 추가 ===
+def run_inference_on_image(device_id: str, image_path: str):
+    """
+    저장된 이미지 파일에 대해 AI 추론을 수행합니다.
+    
+    Args:
+        device_id: 디바이스 ID
+        image_path: 이미지 파일 경로
+        
+    Returns:
+        추론 결과 딕셔너리
+    """
+    try:
+        print(f"[AI] Starting inference for device {device_id}, image: {image_path}")
+        
+        # 이미지 파일 읽기
+        with open(image_path, 'rb') as f:
+            image_bytes = f.read()
+        
+        # 기본 plant_type 설정 (나중에 device별로 설정 가능하도록 확장 가능)
+        # 예: DB에서 device_id로 plant_type 조회
+        plant_type = "default"  # 기본값, 실제로는 DB나 설정에서 가져와야 함
+        
+        # device 정보에서 plant_type 가져오기 시도
+        device_info = get_device_by_device_id_any(device_id)
+        if device_info and device_info.get('plant_type'):
+            plant_type = device_info['plant_type']
+        
+        # model_manager를 사용하여 추론 수행
+        result = model_manager.predict(image_bytes, plant_type)
+        
+        # 타임스탬프 추가
+        result['timestamp'] = datetime.utcnow().isoformat()
+        result['device_id'] = device_id
+        result['plant_type'] = plant_type
+        
+        print(f"[AI] Inference completed for {device_id}: {result}")
+        return result
+        
+    except FileNotFoundError:
+        error_msg = f"Image file not found: {image_path}"
+        print(f"[AI] Error: {error_msg}")
+        return {
+            "error": error_msg,
+            "device_id": device_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        error_msg = f"Inference failed: {str(e)}"
+        print(f"[AI] Error: {error_msg}")
+        return {
+            "error": error_msg,
+            "device_id": device_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
 # --- 데이터 파이프라인 ---
 def process_incoming_data(topic: str, payload):
     try:
@@ -332,21 +388,31 @@ def process_incoming_data(topic: str, payload):
         device_id = topic.split("/")[-1].lower()
         print(f"Processing data for device_id: {device_id}")
 
-        dev = get_device_by_device_id_any(device_id)
-        mac = dev["mac_address"] if dev else None
+        # Device 정보 조회 (mac_address 가져오기 위해)
+        device_info = get_device_by_device_id_any(device_id)
+        mac = device_info.get("mac_address") if device_info else None
 
         # --- 데이터 종류에 따라 분기 처리 (plant_img 키 유무로 판단) ---
         if "plant_img" in payload:
-            # 이미지 데이터 처리
+            # === 이미지 데이터 처리 ===
             image_hex = payload.get("plant_img")
             if image_hex:
+                # 1. HEX 문자열을 바이트로 변환
                 image_bytes = bytes.fromhex(image_hex)
+                
+                # 2. 파일명 생성 및 경로 설정
                 filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
                 path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
+                
+                # 3. 이미지 폴더가 없으면 생성
                 os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
+                
+                # 4. 실제 이미지 파일로 저장
                 with open(path, "wb") as f:
                     f.write(image_bytes)
+                print(f"[Image] Saved image file: {path}")
 
+                # 5. plant_images 테이블에 기록
                 if mac:
                     try:
                         with get_db_connection() as conn:
@@ -355,20 +421,28 @@ def process_incoming_data(topic: str, payload):
                                 (device_id, mac, filename, path, datetime.utcnow().isoformat()),
                             )
                             conn.commit()
+                        print(f"[DB] Saved image metadata to plant_images table")
                     except Exception as e:
-                        print(f"Failed to save image meta to DB for {device_id}: {e}")
+                        print(f"[DB] Failed to save image meta to DB for {device_id}: {e}")
                 else:
-                    # 디바이스 미등록이면 plant_images는 device_id / mac_address NOT NULL 때문에 에러 나니 저장 스킵
-                    print(f"Skip DB insert for image because device not registered: {device_id}")
+                    print(f"[DB] Skip DB insert for image (device not registered): {device_id}")
 
-                set_redis_data(f"latest_image:{device_id}", {"filename": filename})
-                print(f"Image saved: {path}")
+                # 6. Redis에 최신 이미지 정보 저장
+                set_redis_data(f"latest_image:{device_id}", {
+                    "filename": filename,
+                    "filepath": path,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
 
+                # 7. AI 추론 실행
                 diagnosis = run_inference_on_image(device_id, path)
+                
+                # 8. 추론 결과를 Redis에 저장
                 set_redis_data(f"latest_ai_diagnosis:{device_id}", diagnosis)
-                print(f"AI inference complete for {device_id}")
+                print(f"[AI] Inference complete and saved to Redis for {device_id}")
 
         else:
+            # === 센서 데이터 처리 ===
             tags = {"device_id": device_id}
             if mac:
                 tags["mac_address"] = mac

@@ -10,12 +10,22 @@ DATABASE_FILE = BASE_DIR / "data" / "greeneye_users.db"
 DB_PATH = str(DATABASE_FILE)  # ← join 하지 말고 str()로!
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    return conn
+     db_path = str(DATABASE_FILE)
+     os.makedirs(DATABASE_FILE.parent, exist_ok=True)
+     conn = sqlite3.connect(
+         db_path,
+         timeout=30,
+         check_same_thread=False,  # MQTT 콜백 스레드에서도 OK
+     )
+     conn.row_factory = sqlite3.Row
+     try:
+         # Windows 바인드볼륨에서 WAL은 문제를 잘 일으킴 → DELETE 권장
+         conn.execute("PRAGMA journal_mode=DELETE;")
+         conn.execute("PRAGMA synchronous=NORMAL;")
+         conn.execute("PRAGMA busy_timeout=5000;")
+     except Exception:
+         pass
+     return conn
 
 def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
@@ -92,6 +102,10 @@ def init_db():
     if not _column_exists(conn, "devices", "plant_type"):
         conn.execute("ALTER TABLE devices ADD COLUMN plant_type TEXT")
         conn.commit()
+    # ★ room 컬럼 자동 추가 (설치 위치/방 정보)
+    if not _column_exists(conn, "devices", "room"):
+        conn.execute("ALTER TABLE devices ADD COLUMN room TEXT")
+        conn.commit()
     conn.close()
     
 
@@ -139,8 +153,18 @@ def _retry_locked(fn, *args, retries=5, delay=0.2, **kwargs):
                 continue
             raise
 
-def add_device(mac_address: str, friendly_name: str, owner_user_id: int, device_image: Optional[str] = None) -> bool:
+def add_device(
+    mac_address: str,
+    friendly_name: str,
+    owner_user_id: int,
+    device_image: Optional[str] = None,
+    plant_type: Optional[str] = None,
+    room: Optional[str] = None,
+) -> bool:
     """
+    디바이스 등록/소유권 클레임/정보 갱신.
+    - mac_address, friendly_name, (선택) device_image, plant_type, room 저장
+    - plant_type/room이 None이면 기존 값을 유지 (COALESCE)
     """
     device_id = (mac_address.split("-")[-1]).lower()
     conn = get_db_connection()
@@ -149,16 +173,23 @@ def add_device(mac_address: str, friendly_name: str, owner_user_id: int, device_
         if device_image:
             cur = conn.execute(
                 """UPDATE devices
-                   SET mac_address=?, friendly_name=?, device_image=?
-                 WHERE device_id=? AND owner_user_id=?""",
-                (mac_address, friendly_name, device_image, device_id, owner_user_id),
+                     SET mac_address=?,
+                         friendly_name=?,
+                         device_image=?,
+                         plant_type=COALESCE(?, plant_type),
+                         room=COALESCE(?, room)
+                   WHERE device_id=? AND owner_user_id=?""",
+                (mac_address, friendly_name, device_image, plant_type, room, device_id, owner_user_id),
             )
         else:
             cur = conn.execute(
                 """UPDATE devices
-                   SET mac_address=?, friendly_name=?
-                 WHERE device_id=? AND owner_user_id=?""",
-                (mac_address, friendly_name, device_id, owner_user_id),
+                     SET mac_address=?,
+                         friendly_name=?,
+                         plant_type=COALESCE(?, plant_type),
+                         room=COALESCE(?, room)
+                   WHERE device_id=? AND owner_user_id=?""",
+                (mac_address, friendly_name, plant_type, room, device_id, owner_user_id),
             )
         if cur.rowcount > 0:
             conn.commit()
@@ -168,16 +199,25 @@ def add_device(mac_address: str, friendly_name: str, owner_user_id: int, device_
         if device_image:
             cur = conn.execute(
                 """UPDATE devices
-                   SET mac_address=?, friendly_name=?, owner_user_id=?, device_image=?
-                 WHERE device_id=? AND owner_user_id IS NULL""",
-                (mac_address, friendly_name, owner_user_id, device_image, device_id),
+                     SET mac_address=?,
+                         friendly_name=?,
+                         owner_user_id=?,
+                         device_image=?,
+                         plant_type=COALESCE(?, plant_type),
+                         room=COALESCE(?, room)
+                   WHERE device_id=? AND owner_user_id IS NULL""",
+                (mac_address, friendly_name, owner_user_id, device_image, plant_type, room, device_id),
             )
         else:
             cur = conn.execute(
                 """UPDATE devices
-                   SET mac_address=?, friendly_name=?, owner_user_id=?
-                 WHERE device_id=? AND owner_user_id IS NULL""",
-                (mac_address, friendly_name, owner_user_id, device_id),
+                     SET mac_address=?,
+                         friendly_name=?,
+                         owner_user_id=?,
+                         plant_type=COALESCE(?, plant_type),
+                         room=COALESCE(?, room)
+                   WHERE device_id=? AND owner_user_id IS NULL""",
+                (mac_address, friendly_name, owner_user_id, plant_type, room, device_id),
             )
         if cur.rowcount > 0:
             conn.commit()
@@ -186,15 +226,19 @@ def add_device(mac_address: str, friendly_name: str, owner_user_id: int, device_
         # 3) 새로 삽입 시도
         if device_image:
             conn.execute(
-                """INSERT INTO devices (device_id, mac_address, friendly_name, registered_at, owner_user_id, device_image)
-                   VALUES (?, ?, ?, datetime('now'), ?, ?)""",
-                (device_id, mac_address, friendly_name, owner_user_id, device_image),
+                """INSERT INTO devices
+                       (device_id, mac_address, friendly_name, registered_at, owner_user_id,
+                        device_image, plant_type, room)
+                   VALUES (?, ?, ?, datetime('now'), ?, ?, ?, ?)""",
+                (device_id, mac_address, friendly_name, owner_user_id, device_image, plant_type, room),
             )
         else:
             conn.execute(
-                """INSERT INTO devices (device_id, mac_address, friendly_name, registered_at, owner_user_id)
-                   VALUES (?, ?, ?, datetime('now'), ?)""",
-                (device_id, mac_address, friendly_name, owner_user_id),
+                """INSERT INTO devices
+                       (device_id, mac_address, friendly_name, registered_at, owner_user_id,
+                        plant_type, room)
+                   VALUES (?, ?, ?, datetime('now'), ?, ?, ?)""",
+                (device_id, mac_address, friendly_name, owner_user_id, plant_type, room),
             )
         conn.commit()
         return True
@@ -225,7 +269,7 @@ def get_device_by_device_id(device_id: str, owner_user_id: int) -> Optional[dict
 def get_all_devices_any():
     with get_db_connection() as conn:
         rows = conn.execute(
-            "SELECT device_id, friendly_name, device_image, plant_type FROM devices ORDER BY device_id"
+            "SELECT device_id, friendly_name, device_image, plant_type, room FROM devices ORDER BY device_id"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -248,7 +292,8 @@ def get_device_by_friendly_name(friendly_name):
 def get_all_devices(owner_user_id: int):
     with get_db_connection() as conn:
         cur = conn.execute(
-            "SELECT device_id, friendly_name, device_image FROM devices WHERE owner_user_id = ? ORDER BY device_id",
+            "SELECT device_id, friendly_name, device_image, plant_type, room "
+            "FROM devices WHERE owner_user_id = ? ORDER BY device_id",
             (owner_user_id,),
         )
         rows = cur.fetchall()
