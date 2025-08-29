@@ -264,10 +264,10 @@ def token_required(f):
     return decorated
 
 
-# @app.before_first_request
-# def before_first_request():
-#     with app.app_context():
-#         init_runtime_and_scheduler()
+@app.before_first_request
+def _boot_once():
+    with app.app_context():
+        init_runtime_and_scheduler()
 
 def send_realtime_data_to_clients(device_id: str):
     """Redis에 캐시된 최신 센서 데이터를 Socket.IO로 브로드캐스트."""

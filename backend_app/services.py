@@ -166,10 +166,15 @@ def on_message(client, userdata, msg):
     print(f"MQTT Message received: Topic - {msg.topic}")
     if msg.topic.startswith("GreenEye/data/"):
         try:
-            payload = _parse_mqtt_payload(msg.payload)
+            payload = _safe_json_loads(msg.payload)
             process_incoming_data(msg.topic, payload)
         except Exception as e:
             print(f"Error processing incoming data: {e}")
+            # 디버깅용 페이로드 프리뷰
+            try:
+                print("[payload preview]", msg.payload.decode("utf-8", "replace")[:200])
+            except:
+                pass
 
 
 def connect_mqtt():
@@ -314,7 +319,15 @@ def get_redis_data(key: str):
         return None
     try:
         data = redis_client.get(key)
-        return json.loads(data) if data else None
+        if not data:
+            return None
+        # ✅ Redis에 BOM/비표준 JSON이 들어와도 복구 시도
+        if isinstance(data, str):
+            try:
+                return json.loads(data)
+            except Exception:
+                return _safe_json_loads(data.encode("utf-8"))
+        return _safe_json_loads(data)
     except Exception as e:
         print(f"Error getting data from Redis: {e}")
         return None
@@ -329,7 +342,10 @@ def process_incoming_data(topic: str, payload):
             payload = json.loads(payload)
 
         # 토픽: GreenEye/data/{DeviceID}
-        device_id = topic.split("/")[-1].lower()
+        # ✅ 항상 4자리 short id로 정규화 (ge-sd-2e52 -> 2e52)
+        raw_id = topic.split("/")[-1].strip().lower()
+        m = re.fullmatch(r"(?:ge-sd-)?([0-9a-f]{4})", raw_id)
+        device_id = m.group(1) if m else raw_id
         print(f"Processing data for device_id: {device_id}")
 
         dev = get_device_by_device_id_any(device_id)
