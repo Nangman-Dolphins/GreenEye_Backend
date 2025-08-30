@@ -49,6 +49,7 @@ from backend_app.control_logic import (
     check_and_apply_auto_control
 )
 from backend_app.report_generator import send_all_reports
+from backend_app.standards_loader import classify_payload
 
 load_dotenv()
 app = Flask(__name__)
@@ -273,9 +274,17 @@ def send_realtime_data_to_clients(device_id: str):
     """Redis에 캐시된 최신 센서 데이터를 Socket.IO로 브로드캐스트."""
     try:
         data = get_redis_data(f"latest_sensor_data:{device_id}") or {}
-        # 원하는 이벤트/네임스페이스 명은 프로젝트에 맞게 조정
-        # 클라이언트에서 'realtime_data' 이벤트를 수신하도록 되어 있다면 그대로 사용
-        socketio.emit("realtime_data", {"device_id": device_id, **data})
+        # ★ plant_type을 DB에서 읽어 상태까지 포함해 내려준다
+        dev = get_device_by_device_id_any(device_id)
+        plant_type = (dev and dev.get("plant_type")) or None
+        values = classify_payload(plant_type, data)  # {"temperature": {"value":..,"status":..,"range":[..]}, ...}
+        payload = {
+            "device_id": device_id,
+            "plant_type": plant_type,
+            "timestamp": data.get("timestamp"),
+            "values": values,
+        }
+        socketio.emit("realtime_data", payload)
     except Exception as e:
         print(f"Realtime push failed for {device_id}: {e}")
 
@@ -364,10 +373,19 @@ def api_latest_sensor_data(device_id):
     if not data:
         return jsonify({"error": "No data found"}), 404
 
-    data["friendly_name"] = dev["friendly_name"]
+    # 여기서 상태값을 계산해서 프론트로 전달
+    plant_type = dev.get("plant_type")
+    values = classify_payload(plant_type, data)
+    resp = {
+        "device_id": device_id,
+        "friendly_name": dev["friendly_name"],
+        "plant_type": plant_type,
+        "timestamp": data.get("timestamp"),
+        "values": values,
+    }
     if ai:
-        data["ai_diagnosis"] = ai
-    return jsonify(data)
+        resp["ai_diagnosis"] = ai
+    return jsonify(resp)
 
 def _to_num(v):
     try:
