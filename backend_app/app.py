@@ -292,7 +292,6 @@ def init_runtime_and_scheduler():
 
         scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
 
-        #여기! 수정함!!
         print("[init] ⏳ get_all_devices_any()...")
         devices = get_all_devices_any()
         print(f"[init] ✅ Found {len(devices)} device(s) in DB")
@@ -354,7 +353,7 @@ def api_latest_sensor_data(device_id):
     device_id = normalize_device_id(device_id)
     owner_user_id = g.current_user["id"]
 
-    # ✅ 이 유저의 장치인지 확인
+    # 이 유저의 장치인지 확인
     dev = get_device_by_device_id(device_id, owner_user_id)
     if not dev:
         return jsonify({"error":"Device not found"}), 404

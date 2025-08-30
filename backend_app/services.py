@@ -8,7 +8,6 @@ import redis
 from datetime import datetime, timezone
 from werkzeug.utils import secure_filename
 import re
-import base64
 
 import csv
 from io import StringIO
@@ -207,6 +206,8 @@ def connect_mqtt():
     except Exception as e:
         print(f"Could not connect to MQTT broker at {broker_host}:{broker_port} → {e}")
 
+
+
 def write_sensor_data_to_influxdb(measurement, tags, fields, ts=None):
     from influxdb_client import Point, WritePrecision
     from datetime import datetime, timezone
@@ -366,49 +367,36 @@ def process_incoming_data(topic: str, payload):
 
         # --- 데이터 종류에 따라 분기 처리 (plant_img 키 유무로 판단) ---
         if "plant_img" in payload:
-            try: 
-                # 이미지 데이터 처리
-                # ~.jpg로 사진 파일 저장, ~.origin으로 base64 텍스트 원본 저장
-                image_base64 = payload.get("plant_img")
-                if image_base64 and isinstance(image_base64, str):
-                    image_dec = base64.b64decode(image_base64)
+            # 이미지 데이터 처리
+            image_hex = payload.get("plant_img")
+            if image_hex:
+                image_bytes = bytes.fromhex(image_hex)
+                filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+                path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
+                os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(image_bytes)
 
-                    filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    filename_jpg = f"{filename}.jpg"
-                    filename_origin = f"{filename}.origin"
+                if mac:
+                    try:
+                        with get_db_connection() as conn:
+                            conn.execute(
+                                "INSERT INTO plant_images (device_id, mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?, ?)",
+                                (device_id, mac, filename, path, datetime.utcnow().isoformat()),
+                            )
+                            conn.commit()
+                    except Exception as e:
+                        print(f"Failed to save image meta to DB for {device_id}: {e}")
+                else:
+                    # 디바이스 미등록이면 plant_images는 device_id / mac_address NOT NULL 때문에 에러 나니 저장 스킵
+                    print(f"Skip DB insert for image because device not registered: {device_id}")
 
-                    path_jpg = os.path.join(IMAGE_UPLOAD_FOLDER, filename_jpg)
-                    path_origin = os.path.join(IMAGE_UPLOAD_FOLDER, filename_origin)
+                set_redis_data(f"latest_image:{device_id}", {"filename": filename})
+                print(f"Image saved: {path}")
 
-                    os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
-
-                    with open(path_jpg, "wb") as f:
-                        f.write(image_dec)
-                    with open(path_origin, "w", encoding="utf-8") as f:
-                        f.write(image_base64)
-
-                    if mac:
-                        try:
-                            with get_db_connection() as conn:
-                                conn.execute(
-                                    "INSERT INTO plant_images (device_id, mac_address, filename, filepath, timestamp) VALUES (?, ?, ?, ?, ?)",
-                                    (device_id, mac, filename, path_jpg, datetime.utcnow().isoformat()),
-                                )
-                                conn.commit()
-                        except Exception as e:
-                            print(f"Failed to save image meta to DB for {device_id}: {e}")
-                    else:
-                        # 디바이스 미등록이면 plant_images는 device_id / mac_address NOT NULL 때문에 에러 나니 저장 스킵
-                        print(f"Skip DB insert for image because device not registered: {device_id}")
-
-                    set_redis_data(f"latest_image:{device_id}", {"filename": filename})
-                    print(f"Image saved: {path_jpg}")
-
-                    diagnosis = run_inference_on_image(device_id, path_jpg)
-                    set_redis_data(f"latest_ai_diagnosis:{device_id}", diagnosis)
-                    print(f"AI inference complete for {device_id}")
-            except (base64.binascii.Error, TypeError) as e:
-                print(f"Error decoding Base64 string for device {device_id}: {e}")
+                diagnosis = run_inference_on_image(device_id, path)
+                set_redis_data(f"latest_ai_diagnosis:{device_id}", diagnosis)
+                print(f"AI inference complete for {device_id}")
 
         else:
             tags = {"device_id": device_id}
