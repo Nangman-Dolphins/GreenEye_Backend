@@ -2,8 +2,8 @@ from datetime import datetime
 import pytz
 import json
 
-from services import send_config_to_device, get_redis_data
-from database import get_device_by_friendly_name
+from .services import send_config_to_device, get_redis_data
+from .database import get_device_by_friendly_name
 
 def check_and_apply_auto_control(device_id: str):
     tz = pytz.timezone("Asia/Seoul")
