@@ -15,6 +15,18 @@ from io import StringIO
 
 from .database import get_db_connection, get_device_by_device_id_any
 
+FLASH_MAP = {
+    "always_on":  {"flash_en": 1, "flash_nt": 1},  # 주/야 모두 플래시
+    "always_off": {"flash_en": 0, "flash_nt": 0},  # 항상 끔
+    "night_off":  {"flash_en": 1, "flash_nt": 0},  # 주간만 켬
+}
+
+def _publish_conf(device_id: str, payload: dict):
+    """GreenEye/conf/{device_id} 로 retain publish"""
+    topic = f"GreenEye/conf/{device_id}"
+    body = json.dumps(payload, ensure_ascii=False)
+    mqtt_client.publish(topic, body, qos=1, retain=True)
+
 from .ai_inference import run_inference_on_image
 
 from dotenv import load_dotenv
@@ -448,20 +460,30 @@ def process_incoming_data(topic: str, payload):
 
 # 프리셋 모드 매핑(임시) 정의
 PRESET_MODES = {
-    "Z": {"pwr_mode": "Z", "nht_mode": 1, "flash_en": 0, "flash_nt": 0, "flash_level": 0},
-    "L": {"pwr_mode": "L", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": 120},
-    "M": {"pwr_mode": "M", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": 160},
-    "H": {"pwr_mode": "H", "nht_mode": 1, "flash_en": 1, "flash_nt": 1, "flash_level": 200},
-    "U": {"pwr_mode": "U", "nht_mode": 0, "flash_en": 1, "flash_nt": 1, "flash_level": 255},
+    "Z": {"pwr_mode": "Z", "nht_mode": 1, "flash_en": 0, "flash_nt": 0, "flash_level": -1},
+    "L": {"pwr_mode": "L", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": -1},
+    "M": {"pwr_mode": "M", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": -1},
+    "H": {"pwr_mode": "H", "nht_mode": 1, "flash_en": 1, "flash_nt": 1, "flash_level": -1},
+    "U": {"pwr_mode": "U", "nht_mode": 0, "flash_en": 1, "flash_nt": 1, "flash_level": -1},
 }
 
 # 프리셋 모드 전송 함수 정의
-def send_mode_to_device(device_id: str, mode: str):
-    if mode not in PRESET_MODES:
-        raise ValueError(f"Invalid mode '{mode}'. Must be one of {list(PRESET_MODES.keys())}.")
-    config = PRESET_MODES[mode]
-    send_config_to_device(device_id, config)
-    return config
+def send_mode_to_device(device_id: str, mode_char: str,
+                        flash_option: str | None = None,
+                        flash_level: int | None = None):
+    # 모드 프리셋(간단히 기본값; 기존에 프리셋 딕셔너리가 있으면 그걸 재사용)
+    mode = (mode_char or "M").upper()[:1]
+    # 일반적으로 M/L/Z는 야간모드 1, H/U는 0으로 운용 (기존 로직과 맞추세요)
+    base = {"pwr_mode": mode, "nht_mode": 1 if mode in ("M","L","Z") else 0}
+
+    payload = dict(base)
+    if flash_option:
+        payload.update(FLASH_MAP.get(flash_option, {}))
+    # 디바이스 내부에서 밝기 자체 처리 → 항상 -1 고정
+    payload["flash_level"] = -1
+
+    _publish_conf(device_id, payload)
+    return payload
 
 def send_config_to_device(device_id: str, config_payload: dict):
     if not mqtt_client.is_connected():
@@ -470,7 +492,7 @@ def send_config_to_device(device_id: str, config_payload: dict):
     allowed_int = {
         "flash_en": (0, 1),
         "flash_nt": (0, 1),
-        "flash_level": (0, 255),
+        "flash_level": (-1, 255),
         "nht_mode": (0, 1)
     }
     allowed_str = {

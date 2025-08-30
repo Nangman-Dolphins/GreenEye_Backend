@@ -480,13 +480,25 @@ def control_device_by_mode(device_id: str):
         return jsonify({"error":"Device not found"}), 404
 
     data = request.get_json(silent=True) or {}
-    mode = data.get("mode")
-    if not mode:
-        return jsonify({"error": "Missing 'mode' in request body"}), 400
+
+    # 1) 프론트에서 오는 모드 키를 1글자 코드로 정규화 (둘 다 허용)
+    #    ultra_low → Z, low → L, normal → M, high → H, ultra_high → U
+    raw_mode = str(data.get("mode", "")).strip()
+    mode_map = {
+        "ultra_low":"Z", "low":"L", "normal":"M", "high":"H", "ultra_high":"U",
+        "Z":"Z", "L":"L", "M":"M", "H":"H", "U":"U"
+    }
+    mode_char = mode_map.get(raw_mode.upper() if len(raw_mode) == 1 else raw_mode.lower())
+    if not mode_char:
+        return jsonify({"error": "Invalid 'mode'. Use one of Z/L/M/H/U or ultra_low/low/normal/high/ultra_high."}), 400
+
+    # 2) 플래시 옵션/레벨 추가로 수신 (옵션 키 이름은 프론트에서 쓰는 값에 맞춰 둘 다 허용)
+    flash_option = data.get("flash_option") or data.get("night_flash_mode")  # "always_on" | "always_off" | "night_off"
+    flash_level  = data.get("flash_level")  # 0~255 정수 (미지정이면 그대로 None)
 
     try:
-        config = send_mode_to_device(device_id, mode)
-        return jsonify({"status": "success", "device_id": device_id, "mode": mode, "applied_config": config})
+        applied = send_mode_to_device(device_id, mode_char, flash_option=flash_option, flash_level=flash_level)
+        return jsonify({"status":"success", "device_id": device_id, "mode": mode_char, "applied_config": applied})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
