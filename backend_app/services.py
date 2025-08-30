@@ -474,9 +474,39 @@ def send_mode_to_device(device_id: str, mode_char: str,
     return payload
 
 def send_config_to_device(device_id: str, config_payload: dict):
+    """
+    sends a configuration payload to a device via mqtt.
+    this function is flexible and accepts both high-level keys (like 'mode')
+    and low-level keys (like 'pwr_mode').
+    """
     if not mqtt_client.is_connected():
         connect_mqtt()
 
+    if not config_payload:
+        print(f"[warn] send_config_to_device received an empty payload for {device_id}.")
+        return
+
+    to_send = {}
+    
+    # === high-level key translation ===
+    # translate 'mode' (e.g., 'normal', 'low') to 'pwr_mode' (e.g., 'M', 'L')
+    if 'mode' in config_payload:
+        mode_map = {"ultra_low": "Z", "low": "L", "normal": "M", "high": "H", "ultra_high": "U"}
+        raw_mode = str(config_payload['mode']).lower()
+        mode_char = mode_map.get(raw_mode)
+        if mode_char:
+            to_send['pwr_mode'] = mode_char
+            # set default night mode based on power mode
+            to_send['nht_mode'] = 1 if mode_char in ("M", "L", "Z") else 0
+
+    # translate 'flash_option' to 'flash_en' and 'flash_nt'
+    if 'flash_option' in config_payload:
+        flash_setting = FLASH_MAP.get(config_payload['flash_option'])
+        if flash_setting:
+            to_send.update(flash_setting)
+
+    # === low-level key validation and merge ===
+    # allows overriding high-level settings with specific low-level values
     allowed_int = {
         "flash_en": (0, 1),
         "flash_nt": (0, 1),
@@ -487,21 +517,29 @@ def send_config_to_device(device_id: str, config_payload: dict):
         "pwr_mode": {"Z", "L", "M", "H", "U"}
     }
 
-    to_send = {}
-    for k, v in (config_payload or {}).items():
+    for k, v in config_payload.items():
         if k in allowed_int:
             lo, hi = allowed_int[k]
             if isinstance(v, int) and lo <= v <= hi:
-                to_send[k] = v
+                to_send[k] = v  # override if specified
         elif k in allowed_str:
             if isinstance(v, str) and v.upper() in allowed_str[k]:
-                to_send[k] = v.upper()
+                to_send[k] = v.upper() # override if specified
+    
+    # ensure flash_level is always present, defaulting to -1
+    if 'flash_level' not in to_send:
+        to_send['flash_level'] = -1
+
+    if not to_send:
+        print(f"[error] Failed to create a valid config payload for {device_id} from input: {config_payload}")
+        return
 
     topic = f"GreenEye/conf/{device_id}"
-    result = mqtt_client.publish(topic, json.dumps(to_send), retain=True)
-    result.wait_for_publish()  # ✅ 메시지 전송 완료까지 기다림
-    print(f"Sent config to topic: {topic} payload={to_send}")  
+    result = mqtt_client.publish(topic, json.dumps(to_send), qos=1, retain=True)
+    result.wait_for_publish()
+    print(f"Sent config to topic: {topic} payload={to_send}")
 
+    # update redis cache if flash settings were part of the payload
     if any(k in to_send for k in ("flash_en", "flash_nt", "flash_level")):
         set_redis_data(
             f"actuator_state:{device_id}:flash",
