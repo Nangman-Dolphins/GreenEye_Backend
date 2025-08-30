@@ -1,3 +1,4 @@
+# app.py
 import os, secrets
 import json
 import uuid
@@ -125,6 +126,24 @@ def _save_device_image(file_storage, device_id: str) -> str | None:
     file_storage.save(abs_path)
     return f"images/{out_name}"
 
+def _save_device_image_from_base64(b64data: str, device_id: str) -> str | None:
+    """
+    base64로 인코딩된 이미지를 디코딩하여 파일로 저장
+    """
+    if not b64data:
+        return None
+    try:
+        img_bytes = base64.b64decode(b64data.split(",", 1)[-1])
+        filename = f"{device_id}.png"
+        save_path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
+        with open(save_path, "wb") as f:
+            f.write(img_bytes)
+        return f"images/{filename}"
+    except Exception as e:
+        print(f"Error saving base64 image for {device_id}: {e}")
+        return None
+
+
 def _is_shared_image(rel_path: str) -> bool:
     try:
         base = os.path.basename(rel_path)
@@ -194,10 +213,12 @@ def _to_device_id_from_any(s: str) -> str:
     if not s:
         return ""
     t = s.strip()
-    if t.lower().startswith("ge-sd-"):
-        t = t.split("-", 2)[-1]  # 'ge-sd-' 뒤쪽
+    # ✅ "ge-sd-XXXX" 패턴도 지원
+    if t.lower().startswith(f"{DEVICE_PREFIX}-"):
+        t = t.split("-", 2)[-1]
     t = t.replace(":", "").replace("-", "")
     return t[-4:].lower()
+
 
 def _normalize_mac_like(s: str) -> str:
     """
@@ -292,6 +313,7 @@ def init_runtime_and_scheduler():
 
         scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
 
+        #여기! 수정함!!
         print("[init] ⏳ get_all_devices_any()...")
         devices = get_all_devices_any()
         print(f"[init] ✅ Found {len(devices)} device(s) in DB")
@@ -353,7 +375,7 @@ def api_latest_sensor_data(device_id):
     device_id = normalize_device_id(device_id)
     owner_user_id = g.current_user["id"]
 
-    # 이 유저의 장치인지 확인
+    # ✅ 이 유저의 장치인지 확인
     dev = get_device_by_device_id(device_id, owner_user_id)
     if not dev:
         return jsonify({"error":"Device not found"}), 404
@@ -539,64 +561,46 @@ def register_device():
         device_image_path = None
         room = ""
         species = ""
-
+        mac = None
+        
+        # ✅ multipart/form-data 또는 JSON을 모두 처리하도록 로직 변경
         if request.content_type and "multipart/form-data" in request.content_type:
             mac = request.form.get("mac_address")
             friendly_name = request.form.get("friendly_name")
             room = request.form.get("room") or ""
             species = request.form.get("species") or ""
-            if not mac or not friendly_name:
-                return jsonify({"error": "mac_address and friendly_name are required"}), 400
-        else:
-            if not request.is_json:
-                return jsonify({"error": "Request must be JSON"}), 400
+            file = request.files.get("image")
+            if file and file.filename:
+                try:
+                    device_image_path = _save_device_image(file, _to_device_id_from_any(mac))
+                except ValueError as e:
+                    return jsonify({"error": str(e)}), 400
+        
+        elif request.is_json:
             data = request.get_json(silent=True) or {}
             mac = data.get("mac_address")
             friendly_name = data.get("friendly_name")
             room = data.get("room") or ""
             species = data.get("species") or ""
-            if not mac or not friendly_name:
-                return jsonify({"error": "mac_address and friendly_name are required"}), 400
-
-            # base64 이미지는 일단 파싱만(저장은 device_id 계산 후)
-            pending_b64 = None
             image_base64 = data.get("image_base64")
+            
             if image_base64:
-                header, b64data = image_base64.split(",", 1) if "," in image_base64 else ("", image_base64)
-                pending_b64 = b64data
+                # ✅ base64 이미지 처리 로직
+                device_image_path = _save_device_image_from_base64(image_base64, _to_device_id_from_any(mac))
+
+        # 공통 유효성 검사
+        if not mac or not friendly_name:
+            return jsonify({"error": "mac_address and friendly_name are required"}), 400
 
         mac = mac.strip()
-        if not re.fullmatch(r"[A-Za-z0-9]{2}-[A-Za-z0-9]{2}-[0-9a-fA-F]{4}", mac) and \
-            not re.fullmatch(r"ge-sd-[0-9a-fA-F]{4}", mac.lower()):
-            return jsonify({"error":"mac_address must match 'ge-sd-0000' (4 hex)"}), 400
-
-        mac_norm = mac.upper()
-        device_id = mac_norm.split("-")[-1].lower()
+        if not re.fullmatch(r"ge-sd-[0-9a-fA-F]{4}", mac.lower()):
+            return jsonify({"error": "mac_address must match 'ge-sd-0000' (4 hex)"}), 400
+        
+        device_id = _to_device_id_from_any(mac)
         owner_user_id = g.current_user["id"]
 
-        # ✅ 유효성 검사 통과 후에만 파일 저장 (multipart)
-        if request.content_type and "multipart/form-data" in request.content_type:
-            file = request.files.get("image")
-            if file and file.filename:
-                try:
-                    device_image_path = _save_device_image(file, device_id)
-                except ValueError as e:
-                    return jsonify({"error": str(e)}), 400
-                
-        # ✅ JSON base64 저장도 여기서(device_id 확보 후)
-        elif 'pending_b64' in locals() and pending_b64:
-            try:
-                img_bytes = base64.b64decode(pending_b64)
-                filename = f"{device_id}.png"
-                save_path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
-                with open(save_path, "wb") as f:
-                    f.write(img_bytes)
-                device_image_path = f"images/{filename}"
-            except Exception as e:
-                return jsonify({"error": f"Invalid base64 image: {e}"}), 400
-        
         created = add_device(
-            mac_norm,
+            mac,
             friendly_name,
             owner_user_id,
             device_image=device_image_path,
@@ -606,14 +610,14 @@ def register_device():
         if created:
             return jsonify({
                 "message":"registered",
-                "mac_address": mac_norm,
+                "mac_address": mac,
                 "device_id": device_id,
                 "device_image": device_image_path,
                 "plant_type": species,
                 "room": room
             }), 201
         else:
-            return jsonify({"error":"Device already exists","mac_address": mac_norm,"device_id": device_id}), 409
+            return jsonify({"error":"Device already exists","mac_address": mac,"device_id": device_id}), 409
 
     except Exception as e:
         import traceback
@@ -637,7 +641,20 @@ def list_devices():
     owner_user_id = g.current_user["id"]
     # DB 기준으로 이 유저의 장치 목록
     devices = get_all_devices(owner_user_id) or []
-    return jsonify(devices)
+    
+    # ✅ 응답 JSON에 device_image와 plant_type을 명시적으로 포함
+    processed_devices = []
+    for dev in devices:
+        processed_devices.append({
+            "device_id": dev.get("device_id"),
+            "friendly_name": dev.get("friendly_name"),
+            "device_image": dev.get("device_image"), # DB에서 가져온 이미지 경로
+            "plant_type": dev.get("plant_type"),     # DB에서 가져온 식물종
+            "room": dev.get("room"),
+        })
+
+    return jsonify(processed_devices)
+
 
 @app.route("/api/devices/<device_id>/image", methods=["POST"])
 @token_required
