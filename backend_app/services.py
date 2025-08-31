@@ -535,6 +535,7 @@ def process_incoming_data(topic: str, payload):
                 "soil_temp": _to_float(payload.get("soil_temp")),
                 "soil_moisture": _to_float(payload.get("soil_moisture") or payload.get("soil_humi")),
                 "soil_ec": _to_float(payload.get("soil_ec")),
+                "comment": payload.get("comment"),
             }
             valid_fields = {k: v for k, v in fields.items() if v is not None}
 
@@ -567,6 +568,7 @@ def send_mode_to_device(device_id: str,
                         night_option: str ):
     mode = (mode_char or "M").upper()[:1]
     nht = 1 if night_option == "night_on" else 0
+    
     base = {"pwr_mode": mode, "nht_mode": nht}
 
     payload = dict(base)
