@@ -532,29 +532,18 @@ def process_incoming_data(topic: str, payload):
 #     mqtt_client.publish(topic, json.dumps(payload))
 #     print(f"Sent data request to topic: {topic} payload={payload}")
 
-# 프리셋 모드 매핑(임시) 정의
-PRESET_MODES = {
-    "Z": {"pwr_mode": "Z", "nht_mode": 1, "flash_en": 0, "flash_nt": 0, "flash_level": -1},
-    "L": {"pwr_mode": "L", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": -1},
-    "M": {"pwr_mode": "M", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": -1},
-    "H": {"pwr_mode": "H", "nht_mode": 1, "flash_en": 1, "flash_nt": 1, "flash_level": -1},
-    "U": {"pwr_mode": "U", "nht_mode": 0, "flash_en": 1, "flash_nt": 1, "flash_level": -1},
-}
 
 # 프리셋 모드 전송 함수 정의
-def send_mode_to_device(device_id: str, mode_char: str,
-                        flash_option: str | None = None,
-                        flash_level: int | None = None):
+def send_mode_to_device(device_id: str, 
+                        mode_char: str,
+                        night_option: str ):
     # 모드 프리셋(간단히 기본값; 기존에 프리셋 딕셔너리가 있으면 그걸 재사용)
     mode = (mode_char or "M").upper()[:1]
+    nht = 1 if night_option === "night_on" else 0
     # 일반적으로 M/L/Z는 야간모드 1, H/U는 0으로 운용 (기존 로직과 맞추세요)
-    base = {"pwr_mode": mode, "nht_mode": 1 if mode in ("M","L","Z") else 0}
+    base = {"pwr_mode": mode, "nht_mode": nht}
 
     payload = dict(base)
-    if flash_option:
-        payload.update(FLASH_MAP.get(flash_option, {}))
-    # 디바이스 내부에서 밝기 자체 처리 → 항상 -1 고정
-    payload["flash_level"] = -1
 
     _publish_conf(device_id, payload)
     return payload
