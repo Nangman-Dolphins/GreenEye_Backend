@@ -53,6 +53,9 @@ if os.path.exists(font_path):
 else:
     print("[ℹ] NotoSansKR 폰트 파일이 없어 기본 폰트로 진행합니다.")
 
+#테스트로 window 5분
+REPORT_AGG_WINDOW = os.getenv("REPORT_AGG_WINDOW", "1h")
+
 EMAIL_HOST = os.getenv("EMAIL_HOST")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
 EMAIL_USERNAME = os.getenv("EMAIL_USERNAME")
@@ -319,12 +322,13 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     # Influx 쿼리
     start = _fmt_iso_utc(start_dt)
     end   = _fmt_iso_utc(end_dt)
+    #    |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
     query = f"""
     from(bucket: "{INFLUXDB_BUCKET}")
     |> range(start: {start}, stop: {end})
     |> filter(fn: (r) => r["_measurement"] == "sensor_readings")
     |> filter(fn: (r) => r["device_id"] == "{device_id}")
-    |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+    |>aggregateWindow(every: {REPORT_AGG_WINDOW}, fn: mean, createEmpty: false)
     |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
     |> keep(columns: ["_time","device_id","temperature","humidity","light_lux","soil_moisture","soil_temp","soil_ec","battery"])
     """
@@ -499,7 +503,7 @@ def send_all_reports():
                 now,
                 device.get("friendly_name"),
                 device.get("plant_type"),   # devices.plant_type 컬럼
-                device.get("room")          # ★ room 전달
+                device.get("room")          # room 전달
             )
             subject = f"GreenEye 주간 식물 보고서 - {device['friendly_name']}"
             body = "안녕하세요, GreenEye 시스템에서 자동 생성된 식물 생장 보고서를 첨부드립니다."
