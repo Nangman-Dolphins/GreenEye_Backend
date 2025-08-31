@@ -28,7 +28,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conversation_id TEXT NOT NULL,
             user_id INTEGER NOT NULL,                  -- 어떤 유저의 대화인지 연결
-            sender TEXT NOT NULL,                      -- 'user' 또는 'ai'
+            role TEXT NOT NULL,                      -- 'user' 또는 'ai'
             message TEXT NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (id) -- users 테이블과 연결

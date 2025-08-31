@@ -853,9 +853,11 @@ def chat_with_gemini():
         }
         
         headers = {'Content-Type': 'application/json'}
+        print(f"Gemini API 요청 페이로드: {json.dumps(payload)[:500]}...")  # 길 수 있으니 앞부분만 출력
 
         # Gemini API 호출 및 응답 처리 (이하 동일)
         response = requests.post(GEMINI_API_URL, headers=headers, json=payload)
+        print(f"Gemini API 응답 상태: {response.status_code}, 내용: {response.text[:500]}...")  # 앞부분만 출력
         response.raise_for_status()
         
         gemini_response = response.json()
