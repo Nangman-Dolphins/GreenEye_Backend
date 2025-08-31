@@ -540,7 +540,7 @@ def send_mode_to_device(device_id: str,
                         night_option: str ):
     # 모드 프리셋(간단히 기본값; 기존에 프리셋 딕셔너리가 있으면 그걸 재사용)
     mode = (mode_char or "M").upper()[:1]
-    nht = 1 if night_option === "night_on" else 0
+    nht = 1 if night_option == "night_on" else 0
     # 일반적으로 M/L/Z는 야간모드 1, H/U는 0으로 운용 (기존 로직과 맞추세요)
     base = {"pwr_mode": mode, "nht_mode": nht}
 
