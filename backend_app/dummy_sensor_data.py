@@ -11,6 +11,16 @@ import re
 # .env 파일 로드
 load_dotenv()
 
+# --- 더미 코멘트 목록 (임의로 선택하여 이미지와 함께 전송 가능) ---
+DUMMY_COMMENTS = [
+    "싱그러운 토마토! 아주 건강하게 크고 있네요. 🍅",
+    "잎사귀가 아주 튼튼해 보여요!",
+    "수분이 충분해 보입니다. 😊",
+    "햇빛을 많이 받아 무럭무럭 자라는 중입니다. ☀️",
+    "성장 상태가 양호합니다. 다음 분석을 기대해주세요.",
+    "토양 상태가 최적입니다. 👍"
+]
+
 # --- 환경 변수 ---
 MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
 MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT', 1883))
@@ -77,7 +87,7 @@ def make_sensor_payload():
         "amb_light": round(random.uniform(800, 2000), 2),
         "soil_temp": round(random.uniform(18.0, 25.0), 2),
         "soil_humi": round(random.uniform(50.0, 90.0), 2),
-        "soil_ec": round(random.uniform(0.5, 3.0), 2),
+        "soil_ec": round(random.uniform(0.5, 3.0), 2)
     }
 
 def publish_image_hex(device_id: str, img_path: str = TEST_IMAGE_PATH):
@@ -112,6 +122,15 @@ try:
             sensor_payload = make_sensor_payload()
             client.publish(f"GreenEye/data/{device_id}", json.dumps(sensor_payload))
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Published sensor data to GreenEye/data/{device_id} (src '{pid}')")
+            print(f"DEBUG - Sensor Values for {pid}:")
+            print(f"  Temperature: {sensor_payload['amb_temp']}°C")
+            print(f"  Humidity: {sensor_payload['amb_humi']}%")
+            print(f"  Light: {sensor_payload['amb_light']} lux")
+            print(f"  Soil Temp: {sensor_payload['soil_temp']}°C")
+            print(f"  Soil Humidity: {sensor_payload['soil_humi']}%")
+            print(f"  Soil EC: {sensor_payload['soil_ec']} dS/m")
+            print(f"  Comment: {sensor_payload['comment']}")
+            print("  Full payload:", json.dumps(sensor_payload, ensure_ascii=False))
 
             # 2) 주기적으로 이미지 데이터(HEX) 발행
             image_send_counter[pid] += 1

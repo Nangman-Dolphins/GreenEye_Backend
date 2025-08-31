@@ -112,6 +112,8 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+    ports:
+      - "6379:6379"
 
 volumes:
   greeneye_backend_mosquitto_data:
