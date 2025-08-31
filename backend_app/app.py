@@ -781,9 +781,10 @@ def put_alert_thresholds():
     _save_thresholds(th)
     return jsonify(th)
 
+
 # --- Gemini API 관련 설정 ---
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 # base64 이미지 예시
 #{
