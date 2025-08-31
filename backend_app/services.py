@@ -14,6 +14,18 @@ from io import StringIO
 
 from .database import get_db_connection, get_device_by_device_id_any
 
+FLASH_MAP = {
+    "always_on":  {"flash_en": 1, "flash_nt": 1},  # 주/야 모두 플래시
+    "always_off": {"flash_en": 0, "flash_nt": 0},  # 항상 끔
+    "night_off":  {"flash_en": 1, "flash_nt": 0},  # 주간만 켬
+}
+
+def _publish_conf(device_id: str, payload: dict):
+    """GreenEye/conf/{device_id} 로 retain publish"""
+    topic = f"GreenEye/conf/{device_id}"
+    body = json.dumps(payload, ensure_ascii=False)
+    mqtt_client.publish(topic, body, qos=1, retain=True)
+
 from .inference import model_manager
 
 from dotenv import load_dotenv
@@ -166,10 +178,15 @@ def on_message(client, userdata, msg):
     print(f"MQTT Message received: Topic - {msg.topic}")
     if msg.topic.startswith("GreenEye/data/"):
         try:
-            payload = _parse_mqtt_payload(msg.payload)
+            payload = _safe_json_loads(msg.payload)
             process_incoming_data(msg.topic, payload)
         except Exception as e:
             print(f"Error processing incoming data: {e}")
+            # 디버깅용 페이로드 프리뷰
+            try:
+                print("[payload preview]", msg.payload.decode("utf-8", "replace")[:200])
+            except:
+                pass
 
 
 def connect_mqtt():
@@ -188,6 +205,8 @@ def connect_mqtt():
         mqtt_client.loop_start()
     except Exception as e:
         print(f"Could not connect to MQTT broker at {broker_host}:{broker_port} → {e}")
+
+
 
 def write_sensor_data_to_influxdb(measurement, tags, fields, ts=None):
     from influxdb_client import Point, WritePrecision
@@ -314,7 +333,15 @@ def get_redis_data(key: str):
         return None
     try:
         data = redis_client.get(key)
-        return json.loads(data) if data else None
+        if not data:
+            return None
+        # ✅ Redis에 BOM/비표준 JSON이 들어와도 복구 시도
+        if isinstance(data, str):
+            try:
+                return json.loads(data)
+            except Exception:
+                return _safe_json_loads(data.encode("utf-8"))
+        return _safe_json_loads(data)
     except Exception as e:
         print(f"Error getting data from Redis: {e}")
         return None
@@ -375,6 +402,7 @@ def run_inference_on_image(device_id: str, image_path: str):
             "timestamp": datetime.utcnow().isoformat()
         }
 
+
 # --- 데이터 파이프라인 ---
 def process_incoming_data(topic: str, payload):
     try:
@@ -385,34 +413,28 @@ def process_incoming_data(topic: str, payload):
             payload = json.loads(payload)
 
         # 토픽: GreenEye/data/{DeviceID}
-        device_id = topic.split("/")[-1].lower()
+        # ✅ 항상 4자리 short id로 정규화 (ge-sd-2e52 -> 2e52)
+        raw_id = topic.split("/")[-1].strip().lower()
+        m = re.fullmatch(r"(?:ge-sd-)?([0-9a-f]{4})", raw_id)
+        device_id = m.group(1) if m else raw_id
         print(f"Processing data for device_id: {device_id}")
 
-        # Device 정보 조회 (mac_address 가져오기 위해)
-        device_info = get_device_by_device_id_any(device_id)
-        mac = device_info.get("mac_address") if device_info else None
+        dev = get_device_by_device_id_any(device_id)
+        mac = dev["mac_address"] if dev else None
 
         # --- 데이터 종류에 따라 분기 처리 (plant_img 키 유무로 판단) ---
         if "plant_img" in payload:
-            # === 이미지 데이터 처리 ===
+            # 이미지 데이터 처리
             image_hex = payload.get("plant_img")
             if image_hex:
-                # 1. HEX 문자열을 바이트로 변환
                 image_bytes = bytes.fromhex(image_hex)
-                
-                # 2. 파일명 생성 및 경로 설정
                 filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
                 path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
-                
-                # 3. 이미지 폴더가 없으면 생성
                 os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
-                
-                # 4. 실제 이미지 파일로 저장
                 with open(path, "wb") as f:
                     f.write(image_bytes)
-                print(f"[Image] Saved image file: {path}")
+                print(f"[Image] saved image file: {path}")
 
-                # 5. plant_images 테이블에 기록
                 if mac:
                     try:
                         with get_db_connection() as conn:
@@ -425,7 +447,15 @@ def process_incoming_data(topic: str, payload):
                     except Exception as e:
                         print(f"[DB] Failed to save image meta to DB for {device_id}: {e}")
                 else:
-                    print(f"[DB] Skip DB insert for image (device not registered): {device_id}")
+                    # 디바이스 미등록이면 plant_images는 device_id / mac_address NOT NULL 때문에 에러 나니 저장 스킵
+                     print(f"[DB] Skip DB insert for image (device not registered): {device_id}")
+
+                set_redis_data(f"latest_image:{device_id}", {"filename": filename})
+                print(f"Image saved: {path}")
+
+                diagnosis = run_inference_on_image(device_id, path)
+                set_redis_data(f"latest_ai_diagnosis:{device_id}", diagnosis)
+                print(f"AI inference complete for {device_id}")
 
                 # 6. Redis에 최신 이미지 정보 저장
                 set_redis_data(f"latest_image:{device_id}", {
@@ -436,13 +466,13 @@ def process_incoming_data(topic: str, payload):
 
                 # 7. AI 추론 실행
                 diagnosis = run_inference_on_image(device_id, path)
-                
-                # 8. 추론 결과를 Redis에 저장
+
+                 # 8. 추론 결과를 Redis에 저장
                 set_redis_data(f"latest_ai_diagnosis:{device_id}", diagnosis)
                 print(f"[AI] Inference complete and saved to Redis for {device_id}")
 
+
         else:
-            # === 센서 데이터 처리 ===
             tags = {"device_id": device_id}
             if mac:
                 tags["mac_address"] = mac
@@ -492,50 +522,98 @@ def process_incoming_data(topic: str, payload):
 
 # 프리셋 모드 매핑(임시) 정의
 PRESET_MODES = {
-    "Z": {"pwr_mode": "Z", "nht_mode": 1, "flash_en": 0, "flash_nt": 0, "flash_level": 0},
-    "L": {"pwr_mode": "L", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": 120},
-    "M": {"pwr_mode": "M", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": 160},
-    "H": {"pwr_mode": "H", "nht_mode": 1, "flash_en": 1, "flash_nt": 1, "flash_level": 200},
-    "U": {"pwr_mode": "U", "nht_mode": 0, "flash_en": 1, "flash_nt": 1, "flash_level": 255},
+    "Z": {"pwr_mode": "Z", "nht_mode": 1, "flash_en": 0, "flash_nt": 0, "flash_level": -1},
+    "L": {"pwr_mode": "L", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": -1},
+    "M": {"pwr_mode": "M", "nht_mode": 1, "flash_en": 1, "flash_nt": 0, "flash_level": -1},
+    "H": {"pwr_mode": "H", "nht_mode": 1, "flash_en": 1, "flash_nt": 1, "flash_level": -1},
+    "U": {"pwr_mode": "U", "nht_mode": 0, "flash_en": 1, "flash_nt": 1, "flash_level": -1},
 }
 
 # 프리셋 모드 전송 함수 정의
-def send_mode_to_device(device_id: str, mode: str):
-    if mode not in PRESET_MODES:
-        raise ValueError(f"Invalid mode '{mode}'. Must be one of {list(PRESET_MODES.keys())}.")
-    config = PRESET_MODES[mode]
-    send_config_to_device(device_id, config)
-    return config
+def send_mode_to_device(device_id: str, mode_char: str,
+                        flash_option: str | None = None,
+                        flash_level: int | None = None):
+    # 모드 프리셋(간단히 기본값; 기존에 프리셋 딕셔너리가 있으면 그걸 재사용)
+    mode = (mode_char or "M").upper()[:1]
+    # 일반적으로 M/L/Z는 야간모드 1, H/U는 0으로 운용 (기존 로직과 맞추세요)
+    base = {"pwr_mode": mode, "nht_mode": 1 if mode in ("M","L","Z") else 0}
+
+    payload = dict(base)
+    if flash_option:
+        payload.update(FLASH_MAP.get(flash_option, {}))
+    # 디바이스 내부에서 밝기 자체 처리 → 항상 -1 고정
+    payload["flash_level"] = -1
+
+    _publish_conf(device_id, payload)
+    return payload
 
 def send_config_to_device(device_id: str, config_payload: dict):
+    """
+    sends a configuration payload to a device via mqtt.
+    this function is flexible and accepts both high-level keys (like 'mode')
+    and low-level keys (like 'pwr_mode').
+    """
     if not mqtt_client.is_connected():
         connect_mqtt()
 
+    if not config_payload:
+        print(f"[warn] send_config_to_device received an empty payload for {device_id}.")
+        return
+
+    to_send = {}
+    
+    # === high-level key translation ===
+    # translate 'mode' (e.g., 'normal', 'low') to 'pwr_mode' (e.g., 'M', 'L')
+    if 'mode' in config_payload:
+        mode_map = {"ultra_low": "Z", "low": "L", "normal": "M", "high": "H", "ultra_high": "U"}
+        raw_mode = str(config_payload['mode']).lower()
+        mode_char = mode_map.get(raw_mode)
+        if mode_char:
+            to_send['pwr_mode'] = mode_char
+            # set default night mode based on power mode
+            to_send['nht_mode'] = 1 if mode_char in ("M", "L", "Z") else 0
+
+    # translate 'flash_option' to 'flash_en' and 'flash_nt'
+    if 'flash_option' in config_payload:
+        flash_setting = FLASH_MAP.get(config_payload['flash_option'])
+        if flash_setting:
+            to_send.update(flash_setting)
+
+    # === low-level key validation and merge ===
+    # allows overriding high-level settings with specific low-level values
     allowed_int = {
         "flash_en": (0, 1),
         "flash_nt": (0, 1),
-        "flash_level": (0, 255),
+        "flash_level": (-1, 255),
         "nht_mode": (0, 1)
     }
     allowed_str = {
         "pwr_mode": {"Z", "L", "M", "H", "U"}
     }
 
-    to_send = {}
-    for k, v in (config_payload or {}).items():
+    for k, v in config_payload.items():
         if k in allowed_int:
             lo, hi = allowed_int[k]
             if isinstance(v, int) and lo <= v <= hi:
-                to_send[k] = v
+                to_send[k] = v  # override if specified
         elif k in allowed_str:
             if isinstance(v, str) and v.upper() in allowed_str[k]:
-                to_send[k] = v.upper()
+                to_send[k] = v.upper() # override if specified
+    
+    # ensure flash_level is always present, defaulting to -1
+    if 'flash_level' not in to_send:
+        to_send['flash_level'] = -1
+
+    if not to_send:
+        print(f"[error] Failed to create a valid config payload for {device_id} from input: {config_payload}")
+        return
 
     topic = f"GreenEye/conf/{device_id}"
-    result = mqtt_client.publish(topic, json.dumps(to_send), retain=True)
-    result.wait_for_publish()  # ✅ 메시지 전송 완료까지 기다림
-    print(f"Sent config to topic: {topic} payload={to_send}")  
+    result = mqtt_client.publish(topic, json.dumps(to_send), qos=1, retain=True)
+    result.wait_for_publish()
+    print(f"Sent config to topic: {topic} payload={to_send}")
 
+    # update redis cache if flash settings were part of the payload
     if any(k in to_send for k in ("flash_en", "flash_nt", "flash_level")):
         set_redis_data(
             f"actuator_state:{device_id}:flash",

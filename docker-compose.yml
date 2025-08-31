@@ -10,8 +10,9 @@ services:
       gunicorn --workers 1 --threads 4 --timeout 120
       -b 0.0.0.0:5000 backend_app.wsgi:app
     volumes:
-      - images_data:/app/backend_app/images
-      - users_db:/app/data
+      # 로컬 폴더 ↔ 컨테이너 경로 (바인드 마운트)
+      - ./backend_app/images:/app/backend_app/images
+      - ./data:/app/data
     env_file:
       - .env
     environment:
@@ -51,10 +52,9 @@ services:
       - "8000:80"
       - "443:443"
     volumes:
-      - ./nginx_config/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./backend_app/images:/app/backend_app/images:ro
-      - ../GreenEye_Frontend/dist:/usr/share/nginx/html:ro #여기! 수정함!!
-      - images_data:/app/backend_app/images:ro
+      - ../GreenEye_Frontend/dist:/usr/share/nginx/html:ro
+      - ./nginx_config/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       greeneye_backend_app:
         condition: service_healthy
@@ -119,5 +119,4 @@ volumes:
   influxdb_data:
   influxdb_config:
   redis_data:
-  users_db:
   images_data:

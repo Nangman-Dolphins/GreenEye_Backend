@@ -32,7 +32,7 @@ gemini_bp = Blueprint('gemini_api', __name__)
 
 # --- 설정 부분 ---
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') # .env 파일에 GEMINI_API_KEY로 저장하세요.
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 # --- 설정 끝 ---
 
 def format_history_for_gemini(history):

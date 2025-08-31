@@ -1,4 +1,3 @@
-# 베이스 이미지: Python 3.12를 기반으로 하는 가벼운 Alpine Linux 이미지 사용
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -20,6 +19,8 @@ COPY fonts /app/fonts
 
 # 복사한 requirements.txt를 사용해 파이썬 패키지들을 설치
 RUN pip install --no-cache-dir -r requirements.txt
+
+
 
 # 로컬의 모든 프로젝트 파일을 컨테이너의 /app 디렉토리로 복사
 COPY . .

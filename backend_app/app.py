@@ -51,6 +51,7 @@ from backend_app.control_logic import (
     check_and_apply_auto_control
 )
 from backend_app.report_generator import send_all_reports
+from backend_app.standards_loader import classify_payload
 
 load_dotenv()
 app = Flask(__name__)
@@ -266,18 +267,26 @@ def token_required(f):
     return decorated
 
 
-# @app.before_first_request
-# def before_first_request():
-#     with app.app_context():
-#         init_runtime_and_scheduler()
+@app.before_first_request
+def _boot_once():
+    with app.app_context():
+        init_runtime_and_scheduler()
 
 def send_realtime_data_to_clients(device_id: str):
     """Redis에 캐시된 최신 센서 데이터를 Socket.IO로 브로드캐스트."""
     try:
         data = get_redis_data(f"latest_sensor_data:{device_id}") or {}
-        # 원하는 이벤트/네임스페이스 명은 프로젝트에 맞게 조정
-        # 클라이언트에서 'realtime_data' 이벤트를 수신하도록 되어 있다면 그대로 사용
-        socketio.emit("realtime_data", {"device_id": device_id, **data})
+        # ★ plant_type을 DB에서 읽어 상태까지 포함해 내려준다
+        dev = get_device_by_device_id_any(device_id)
+        plant_type = (dev and dev.get("plant_type")) or None
+        values = classify_payload(plant_type, data)  # {"temperature": {"value":..,"status":..,"range":[..]}, ...}
+        payload = {
+            "device_id": device_id,
+            "plant_type": plant_type,
+            "timestamp": data.get("timestamp"),
+            "values": values,
+        }
+        socketio.emit("realtime_data", payload)
     except Exception as e:
         print(f"Realtime push failed for {device_id}: {e}")
 
@@ -298,7 +307,6 @@ def init_runtime_and_scheduler():
 
         scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
 
-        #여기! 수정함!!
         print("[init] ⏳ get_all_devices_any()...")
         devices = get_all_devices_any()
         print(f"[init] ✅ Found {len(devices)} device(s) in DB")
@@ -360,7 +368,7 @@ def api_latest_sensor_data(device_id):
     device_id = normalize_device_id(device_id)
     owner_user_id = g.current_user["id"]
 
-    # ✅ 이 유저의 장치인지 확인
+    # 이 유저의 장치인지 확인
     dev = get_device_by_device_id(device_id, owner_user_id)
     if not dev:
         return jsonify({"error":"Device not found"}), 404
@@ -371,10 +379,19 @@ def api_latest_sensor_data(device_id):
     if not data:
         return jsonify({"error": "No data found"}), 404
 
-    data["friendly_name"] = dev["friendly_name"]
+    # 여기서 상태값을 계산해서 프론트로 전달
+    plant_type = dev.get("plant_type")
+    values = classify_payload(plant_type, data)
+    resp = {
+        "device_id": device_id,
+        "friendly_name": dev["friendly_name"],
+        "plant_type": plant_type,
+        "timestamp": data.get("timestamp"),
+        "values": values,
+    }
     if ai:
-        data["ai_diagnosis"] = ai
-    return jsonify(data)
+        resp["ai_diagnosis"] = ai
+    return jsonify(resp)
 
 def _to_num(v):
     try:
@@ -486,13 +503,25 @@ def control_device_by_mode(device_id: str):
         return jsonify({"error":"Device not found"}), 404
 
     data = request.get_json(silent=True) or {}
-    mode = data.get("mode")
-    if not mode:
-        return jsonify({"error": "Missing 'mode' in request body"}), 400
+
+    # 1) 프론트에서 오는 모드 키를 1글자 코드로 정규화 (둘 다 허용)
+    #    ultra_low → Z, low → L, normal → M, high → H, ultra_high → U
+    raw_mode = str(data.get("mode", "")).strip()
+    mode_map = {
+        "ultra_low":"Z", "low":"L", "normal":"M", "high":"H", "ultra_high":"U",
+        "Z":"Z", "L":"L", "M":"M", "H":"H", "U":"U"
+    }
+    mode_char = mode_map.get(raw_mode.upper() if len(raw_mode) == 1 else raw_mode.lower())
+    if not mode_char:
+        return jsonify({"error": "Invalid 'mode'. Use one of Z/L/M/H/U or ultra_low/low/normal/high/ultra_high."}), 400
+
+    # 2) 플래시 옵션/레벨 추가로 수신 (옵션 키 이름은 프론트에서 쓰는 값에 맞춰 둘 다 허용)
+    flash_option = data.get("flash_option") or data.get("night_flash_mode")  # "always_on" | "always_off" | "night_off"
+    flash_level  = data.get("flash_level")  # 0~255 정수 (미지정이면 그대로 None)
 
     try:
-        config = send_mode_to_device(device_id, mode)
-        return jsonify({"status": "success", "device_id": device_id, "mode": mode, "applied_config": config})
+        applied = send_mode_to_device(device_id, mode_char, flash_option=flash_option, flash_level=flash_level)
+        return jsonify({"status":"success", "device_id": device_id, "mode": mode_char, "applied_config": applied})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -532,35 +561,44 @@ def login_user():
 def register_device():
     try:
         device_image_path = None
+        room = ""
+        species = ""
 
-        # 1) multipart/form-data (권장: 파일 업로드)
         if request.content_type and "multipart/form-data" in request.content_type:
             mac = request.form.get("mac_address")
             friendly_name = request.form.get("friendly_name")
+            room = request.form.get("room") or ""
+            species = request.form.get("species") or ""
             if not mac or not friendly_name:
                 return jsonify({"error": "mac_address and friendly_name are required"}), 400
         else:
-            # 2) JSON (기존 방식도 유지)
             if not request.is_json:
                 return jsonify({"error": "Request must be JSON"}), 400
             data = request.get_json(silent=True) or {}
             mac = data.get("mac_address")
             friendly_name = data.get("friendly_name")
+            room = data.get("room") or ""
+            species = data.get("species") or ""
             if not mac or not friendly_name:
                 return jsonify({"error": "mac_address and friendly_name are required"}), 400
 
-        # 형식: ge-sd-0000 (하이픈 1개, 뒤 4자리는 16진수)
+            # base64 이미지는 일단 파싱만(저장은 device_id 계산 후)
+            pending_b64 = None
+            image_base64 = data.get("image_base64")
+            if image_base64:
+                header, b64data = image_base64.split(",", 1) if "," in image_base64 else ("", image_base64)
+                pending_b64 = b64data
+
         mac = mac.strip()
         if not re.fullmatch(r"[A-Za-z0-9]{2}-[A-Za-z0-9]{2}-[0-9a-fA-F]{4}", mac) and \
             not re.fullmatch(r"ge-sd-[0-9a-fA-F]{4}", mac.lower()):
-                return jsonify({"error":"mac_address must match 'ge-sd-0000' (4 hex)"}), 400
+            return jsonify({"error":"mac_address must match 'ge-sd-0000' (4 hex)"}), 400
 
-        # 저장은 대문자로(보기 좋게), device_id는 소문자 4자리
         mac_norm = mac.upper()
         device_id = mac_norm.split("-")[-1].lower()
         owner_user_id = g.current_user["id"]
 
-        # 이미지 업로드가 있으면 저장
+        # ✅ 유효성 검사 통과 후에만 파일 저장 (multipart)
         if request.content_type and "multipart/form-data" in request.content_type:
             file = request.files.get("image")
             if file and file.filename:
@@ -568,14 +606,35 @@ def register_device():
                     device_image_path = _save_device_image(file, device_id)
                 except ValueError as e:
                     return jsonify({"error": str(e)}), 400
-
-        created = add_device(mac_norm, friendly_name, owner_user_id, device_image=device_image_path)
+                
+        # ✅ JSON base64 저장도 여기서(device_id 확보 후)
+        elif 'pending_b64' in locals() and pending_b64:
+            try:
+                img_bytes = base64.b64decode(pending_b64)
+                filename = f"{device_id}.png"
+                save_path = os.path.join(IMAGE_UPLOAD_FOLDER, filename)
+                with open(save_path, "wb") as f:
+                    f.write(img_bytes)
+                device_image_path = f"images/{filename}"
+            except Exception as e:
+                return jsonify({"error": f"Invalid base64 image: {e}"}), 400
+        
+        created = add_device(
+            mac_norm,
+            friendly_name,
+            owner_user_id,
+            device_image=device_image_path,
+            plant_type=species,
+            room=room
+        )
         if created:
             return jsonify({
                 "message":"registered",
                 "mac_address": mac_norm,
                 "device_id": device_id,
-                "device_image": device_image_path
+                "device_image": device_image_path,
+                "plant_type": species,
+                "room": room
             }), 201
         else:
             return jsonify({"error":"Device already exists","mac_address": mac_norm,"device_id": device_id}), 409

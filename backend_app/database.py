@@ -4,10 +4,37 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import re
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATABASE_FILE = BASE_DIR / "data" / "greeneye_users.db"
 DB_PATH = str(DATABASE_FILE)  # ← join 하지 말고 str()로!
+
+def _normalize_mac(mac: str) -> str:
+    """
+    MAC 주소 형식을 통일한다.
+    - 언더스코어(_) → 하이픈(-)
+    - 대문자화
+    """
+    if mac is None:
+        return mac
+    return mac.replace("_", "-").upper()
+
+def _derive_device_id_from_mac(mac: str) -> str:
+    """
+    정규화된 MAC에서 device_id(마지막 4자리)를 일관되게 만든다.
+    - 마지막 하이픈 구간에서 0-9A-F만 추출한 뒤 끝 4글자 사용
+    - 그래도 4글자 미만이면 해당 구간의 끝 4글자 사용
+    - 최종 소문자
+    예) GE-SD-2A42, GE_SD_2A42, GE:SD:2A42 → 모두 '2a42'
+    """
+    if not mac:
+        return ""
+    norm = _normalize_mac(mac)
+    tail = norm.split("-")[-1]  # 마지막 구간
+    hex_only = re.sub(r"[^0-9A-F]", "", tail)
+    base = hex_only if hex_only else tail
+    return base[-4:].lower()
 
 def get_db_connection():
      db_path = str(DATABASE_FILE)
@@ -106,6 +133,29 @@ def init_db():
     if not _column_exists(conn, "devices", "room"):
         conn.execute("ALTER TABLE devices ADD COLUMN room TEXT")
         conn.commit()
+    
+    # ★ 추가: 기존 레코드 정규화 마이그레이션(안전하게 best-effort)
+    try:
+        rows = conn.execute("SELECT id, mac_address FROM devices").fetchall()
+        for r in rows:
+            mac = r["mac_address"]
+            norm_mac = _normalize_mac(mac)
+            dev_id = _derive_device_id_from_mac(norm_mac)
+            # 이미 정규화돼 있고 device_id도 일치하면 스킵
+            cur = conn.execute("SELECT device_id FROM devices WHERE id=?", (r["id"],))
+            current_dev_id = cur.fetchone()["device_id"]
+            if mac == norm_mac and current_dev_id == dev_id:
+                continue
+            # 충돌 방지: 동일 device_id가 이미 있으면 이 레코드는 스킵
+            dup = conn.execute("SELECT 1 FROM devices WHERE id<>? AND (mac_address=? OR device_id=?)",
+                               (r["id"], norm_mac, dev_id)).fetchone()
+            if dup:
+                continue
+            conn.execute("UPDATE devices SET mac_address=?, device_id=? WHERE id=?",
+                         (norm_mac, dev_id, r["id"]))
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
     
 
@@ -162,75 +212,30 @@ def add_device(
     room: Optional[str] = None,
 ) -> bool:
     """
-    디바이스 등록/소유권 클레임/정보 갱신.
-    - mac_address, friendly_name, (선택) device_image, plant_type, room 저장
-    - plant_type/room이 None이면 기존 값을 유지 (COALESCE)
+    디바이스 **최초 1회만 등록**을 허용한다.
+    - 동일 device_id 또는 동일 mac_address가 이미 존재하면 **무조건 False** (두 번째 등록 차단)
+    - 수정은 별도 엔드포인트/함수를 사용
     """
-    device_id = (mac_address.split("-")[-1]).lower()
+    norm_mac = _normalize_mac(mac_address)
+    device_id = _derive_device_id_from_mac(norm_mac)
     conn = get_db_connection()
     try:
-        # 1) 내 소유인 경우 필드 업데이트 허용
-        if device_image:
-            cur = conn.execute(
-                """UPDATE devices
-                     SET mac_address=?,
-                         friendly_name=?,
-                         device_image=?,
-                         plant_type=COALESCE(?, plant_type),
-                         room=COALESCE(?, room)
-                   WHERE device_id=? AND owner_user_id=?""",
-                (mac_address, friendly_name, device_image, plant_type, room, device_id, owner_user_id),
-            )
-        else:
-            cur = conn.execute(
-                """UPDATE devices
-                     SET mac_address=?,
-                         friendly_name=?,
-                         plant_type=COALESCE(?, plant_type),
-                         room=COALESCE(?, room)
-                   WHERE device_id=? AND owner_user_id=?""",
-                (mac_address, friendly_name, plant_type, room, device_id, owner_user_id),
-            )
-        if cur.rowcount > 0:
-            conn.commit()
-            return True
+        # 이미 등록된 디바이스인가?
+        exists = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id=? OR mac_address=?",
+            (device_id, norm_mac),
+        ).fetchone()
+        if exists:
+            return False
 
-        # 2) 미귀속(주인 없음) 디바이스라면 내가 가져간다(Claim)
-        if device_image:
-            cur = conn.execute(
-                """UPDATE devices
-                     SET mac_address=?,
-                         friendly_name=?,
-                         owner_user_id=?,
-                         device_image=?,
-                         plant_type=COALESCE(?, plant_type),
-                         room=COALESCE(?, room)
-                   WHERE device_id=? AND owner_user_id IS NULL""",
-                (mac_address, friendly_name, owner_user_id, device_image, plant_type, room, device_id),
-            )
-        else:
-            cur = conn.execute(
-                """UPDATE devices
-                     SET mac_address=?,
-                         friendly_name=?,
-                         owner_user_id=?,
-                         plant_type=COALESCE(?, plant_type),
-                         room=COALESCE(?, room)
-                   WHERE device_id=? AND owner_user_id IS NULL""",
-                (mac_address, friendly_name, owner_user_id, plant_type, room, device_id),
-            )
-        if cur.rowcount > 0:
-            conn.commit()
-            return True
-
-        # 3) 새로 삽입 시도
+        # 신규 등록만 허용
         if device_image:
             conn.execute(
                 """INSERT INTO devices
                        (device_id, mac_address, friendly_name, registered_at, owner_user_id,
                         device_image, plant_type, room)
                    VALUES (?, ?, ?, datetime('now'), ?, ?, ?, ?)""",
-                (device_id, mac_address, friendly_name, owner_user_id, device_image, plant_type, room),
+                (device_id, norm_mac, friendly_name, owner_user_id, device_image, plant_type, room),
             )
         else:
             conn.execute(
@@ -238,13 +243,11 @@ def add_device(
                        (device_id, mac_address, friendly_name, registered_at, owner_user_id,
                         plant_type, room)
                    VALUES (?, ?, ?, datetime('now'), ?, ?, ?)""",
-                (device_id, mac_address, friendly_name, owner_user_id, plant_type, room),
+                (device_id, norm_mac, friendly_name, owner_user_id, plant_type, room),
             )
         conn.commit()
         return True
-
     except sqlite3.IntegrityError:
-        # 여기까지 왔는데도 무결성 위반이면 대부분 '남이 소유한' 케이스
         return False
     finally:
         conn.close()
@@ -252,10 +255,11 @@ def add_device(
 def get_device_by_mac(mac_address):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_address,))
-    device = cur.fetchone()
+    mac_norm = _normalize_mac(mac_address)
+    cur.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_norm,))
+    row = cur.fetchone()
     conn.close()
-    return device
+    return row
 
 def get_device_by_device_id(device_id: str, owner_user_id: int) -> Optional[dict]:
     with get_db_connection() as conn:

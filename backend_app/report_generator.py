@@ -21,7 +21,7 @@ from email.header import Header
 from email.utils import formataddr
 from dotenv import load_dotenv
 from .services import connect_influxdb, query_influxdb_data
-from .database import get_all_devices_any, get_all_users
+from .database import get_db_connection, get_all_devices_any, get_all_users, get_device_by_device_id_any
 from pathlib import Path
 import pandas as pd
 from typing import List, Tuple, Optional
@@ -62,8 +62,6 @@ INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET") or "sensor_data"
 
 def _fmt_iso_utc(dt):
     return dt.astimezone(pytz.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-import matplotlib.dates as mdates
 
 def generate_graph_image(rows, field, label):
     def _to_float(v):
@@ -133,12 +131,83 @@ def generate_graph_image(rows, field, label):
 #   - standards 파일은 열(Column) 이름 예: plant(식물명), temperature_min/max, humidity_min/max, ...
 #   - 프로젝트 내 실제 컬럼명에 맞춰 key 매핑을 조정하세요.
 # ─────────────────────────────────────────────────────────────────────────────
-def load_standards() -> Optional[pd.DataFrame]:
+def _parse_range(s):
+    """'10 ~ 20' 같은 문자열을 (10.0, 20.0)로 변환"""
+    if s is None:
+        return (None, None)
     try:
-        return pd.read_excel(STANDARDS_PATH)
+        txt = str(s).replace('~', ' ~ ').replace('−', '-')
+        parts = [p.strip() for p in txt.split('~')]
+        if len(parts) == 2:
+            lo = float(parts[0].replace(',', '').split()[0])
+            hi = float(parts[1].replace(',', '').split()[0])
+            return (lo, hi)
+    except:
+        pass
+    return (None, None)
+
+def load_standards() -> Optional[pd.DataFrame]:
+    """
+    엑셀의 한글 컬럼/문자열 범위를 내부 표준 컬럼으로 정규화:
+      식물명 → plant_name
+      환경온도(°C) → temperature_min/max
+      환경습도(%) → humidity_min/max
+      환경광도(lux) 또는 ' 환경광도(lux)' → light_lux_min/max
+      토양온도(°C) → soil_temp_min/max
+      토양수분(%) → soil_moisture_min/max
+      토양전도도(uS/cm) → soil_ec_min/max
+    """
+    try:
+        df = pd.read_excel(STANDARDS_PATH)
     except Exception as e:
         print(f"[WARN] could not load standards: {e}")
         return None
+
+    # 1) 컬럼명 공백 제거
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 2) 한글 컬럼명 매핑 사전
+    COLS = {
+        "plant_name": "식물명",
+        "temperature": "환경온도(°C)",
+        "humidity": "환경습도(%)",
+        "light_lux": "환경광도(lux)",
+        "soil_temp": "토양온도(°C)",
+        "soil_moisture": "토양수분(%)",
+        "soil_ec": "토양전도도(uS/cm)",
+    }
+    # 환경광도 컬럼이 앞 공백으로 들어온 경우도 보정
+    if "환경광도(lux)" not in df.columns and "환경광도(lux)".strip() not in df.columns:
+        for c in df.columns:
+            if c.replace(" ", "") == "환경광도(lux)":
+                COLS["light_lux"] = c
+                break
+
+    # 3) plant_name 표준화
+    if COLS["plant_name"] not in df.columns:
+        print("[WARN] standards: 식물명 컬럼을 찾지 못했습니다.")
+        return None
+    df["plant_name_norm"] = (
+        df[COLS["plant_name"]]
+        .astype(str).str.strip().str.lower()
+    )
+
+    # 4) 각 항목을 min/max 숫자 컬럼으로 분해
+    def split_to_minmax(colname, out_prefix):
+        if colname not in df.columns:
+            return
+        mins, maxs = zip(*df[colname].map(_parse_range))
+        df[f"{out_prefix}_min"] = mins
+        df[f"{out_prefix}_max"] = maxs
+
+    split_to_minmax(COLS["temperature"],   "temperature")
+    split_to_minmax(COLS["humidity"],      "humidity")
+    split_to_minmax(COLS["light_lux"],     "light_lux")
+    split_to_minmax(COLS["soil_temp"],     "soil_temp")
+    split_to_minmax(COLS["soil_moisture"], "soil_moisture")
+    split_to_minmax(COLS["soil_ec"],       "soil_ec")
+
+    return df
 
 def get_range(standards: Optional[pd.DataFrame], plant_type: Optional[str], field: str) -> Tuple[Optional[float], Optional[float]]:
     """
@@ -148,17 +217,22 @@ def get_range(standards: Optional[pd.DataFrame], plant_type: Optional[str], fiel
     if standards is None or not plant_type:
         return None, None
     df = standards
-    # 표준화: plant / Plant / 식물명 등 케이스에 맞게 정규화
-    plant_col = None
-    for c in df.columns:
-        if str(c).lower() in ("plant", "plant_type", "species", "식물", "식물명"):
-            plant_col = c
-            break
-    if plant_col is None:
-        return None, None
-    row = df.loc[df[plant_col].astype(str).str.strip().str.lower() == str(plant_type).strip().lower()]
+    # 동의어/부분일치 허용 (예: 'rhododendron' ↔ '진달래/철쭉' 표기)
+    aliases = {
+        "rhododendron": ["rhododendron", "진달래", "철쭉", "azalea"],
+        "monstera": ["monstera", "몬스테라"],
+        "sansevieria": ["sansevieria", "산세베리아", "스투키", "dracaena trifasciata"],
+        "ficus elastica": ["ficus elastica", "고무나무"],
+    }
+    key = str(plant_type).strip().lower()
+    keys = aliases.get(key, [key])
+    mask = df["plant_name_norm"].apply(lambda s: any(k in s for k in keys))
+    row = df.loc[mask]
     if row.empty:
-        return None, None
+        # 완전일치 시도 (마지막 보루)
+        row = df.loc[df["plant_name_norm"] == key]
+        if row.empty:
+            return None, None
     lo_col = f"{field}_min"
     hi_col = f"{field}_max"
     lo = row.iloc[0].get(lo_col, None)
@@ -201,8 +275,19 @@ def find_out_of_range_intervals(times: List[datetime], values: List[float], lo: 
     # 정상(범위 내)만 있었다면 빈 리스트일 수 있음
     return out
 
-def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, plant_type=None):
-    filename = f"greeneye_report_{device_id}_{start_dt.strftime('%Y%m%d')}.pdf"
+def _resolve_room(device_id: str, room: str | None) -> str | None:
+    if room:  # 호출 시 이미 넘겨준 경우
+        return room
+    try:
+        c = get_db_connection()
+        row = c.execute("SELECT room FROM devices WHERE device_id=?", (device_id,)).fetchone()
+        return row["room"] if row and row["room"] else None
+    except Exception:
+        return None
+
+def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, plant_type=None, room=None):
+    room = _resolve_room(device_id, room)
+    filename = f"greeneye_report_{device_id}_{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.pdf"
     temp_dir = tempfile.gettempdir()
     filepath = os.path.join(temp_dir, filename)
     doc = SimpleDocTemplate(filepath, pagesize=A4)
@@ -215,25 +300,41 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     styles.add(ParagraphStyle(name='NotoTitle',    parent=styles['Title'],    fontName=base_font))
     styles.add(ParagraphStyle(name='NotoNormal',   parent=styles['Normal'],   fontName=base_font))
     styles.add(ParagraphStyle(name='NotoHeading4', parent=styles['Heading4'], fontName=base_font))
+        
+    # if not room:
+    #     # DB에서 room 가져오기
+    #     try:
+    #         from .database import get_device_by_device_id_any
+    #         dev = get_device_by_device_id_any(device_id) or {}
+    #         room = dev.get("room")
+    #     except Exception:
+    #         room = None
+    # print(f"[DEBUG] room resolved to: {room!r}")
     
-    story.append(Paragraph(f"<b>GreenEye 월간 식물 보고서 - {friendly_name} ({device_id})</b>", styles['NotoTitle']))
+    story.append(Paragraph(f"<b>GreenEye 주간 식물 보고서 - {friendly_name} ({device_id})</b>", styles['NotoTitle']))
+    
     story.append(Paragraph(f"기간: {start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}", styles['NotoNormal']))
+    
     if plant_type:
         story.append(Paragraph(f"식물 종류: {plant_type}", styles['NotoNormal']))
-
+    
     # --- 배터리 상태 문자열 함수: 사용 전에 정의 ---
     def battery_status_string(level):
         if level is None:
             return "데이터 없음"
-        elif level >= 75:
-            return f"매우 양호 ({level:.2f}%)"
-        elif level >= 40:
+        elif level >= 65:
             return f"양호 ({level:.2f}%)"
+        elif level >= 40:
+            return f"낮음 ({level:.2f}%)"
         elif level >= 15:
-            return f"부족 ({level:.2f}%)"
-        else:
             return f"매우 낮음 ({level:.2f}%)"
-
+        else:
+            return f"위험 ({level:.2f}%)"
+    
+    story.append(Paragraph(f"위치: {room or '(미설정)'}", styles['NotoNormal']))
+    
+    room = None
+    
     start = _fmt_iso_utc(start_dt)
     end = _fmt_iso_utc(end_dt)
     plant_id = device_id
@@ -395,6 +496,9 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
 
 def send_email_with_pdf(to_email, subject, body_text, pdf_path):
     msg = MIMEMultipart()
+    if not EMAIL_USERNAME:
+        print("[WARN] EMAIL_USERNAME not set. Skipping email send; PDF only.")
+        return False
     msg["From"] = formataddr(("GreenEye", EMAIL_USERNAME))
     msg["To"] = to_email
     msg["Subject"] = Header(subject, "utf-8")  # 한글 제목 안전
@@ -424,7 +528,8 @@ def send_all_reports():
     users = get_all_users()
     devices = get_all_devices_any()
     now = datetime.now().astimezone(pytz.utc)  # ✅ 로컬시간 -> UTC로 변환
-    start = now - timedelta(days=1)
+    # 주간 리포트
+    start = now - timedelta(days=7)
 
     for user in users:
         email = user["email"]
@@ -434,9 +539,10 @@ def send_all_reports():
                 start,
                 now,
                 device.get("friendly_name"),
-                device.get("plant_type")  # devices.plant_type 컬럼을 사용
+                device.get("plant_type"),   # devices.plant_type 컬럼
+                device.get("room")          # ★ room 전달
             )
-            subject = f"GreenEye 월간 식물 보고서 - {device['friendly_name']}"
+            subject = f"GreenEye 주간 식물 보고서 - {device['friendly_name']}"
             body = "안녕하세요, GreenEye 시스템에서 자동 생성된 식물 생장 보고서를 첨부드립니다."
             send_email_with_pdf(email, subject, body, pdf)
     print(f"--- PDF 보고서 전송 완료 ---\n")

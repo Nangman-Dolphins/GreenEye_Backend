@@ -1,0 +1,6 @@
+Black_Spot
+Downy_Mildew
+Insects_Infected
+Mosaic
+blight
+healthy
