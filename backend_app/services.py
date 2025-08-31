@@ -10,6 +10,7 @@ from werkzeug.utils import secure_filename
 import re
 import base64
 
+
 import csv
 from io import StringIO
 
@@ -27,7 +28,7 @@ def _publish_conf(device_id: str, payload: dict):
     body = json.dumps(payload, ensure_ascii=False)
     mqtt_client.publish(topic, body, qos=1, retain=True)
 
-from .ai_inference import run_inference_on_image
+from .inference import model_manager
 
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=".env", override=False)
@@ -346,6 +347,63 @@ def get_redis_data(key: str):
     except Exception as e:
         print(f"Error getting data from Redis: {e}")
         return None
+
+# === 추론 함수 추가 ===
+def run_inference_on_image(device_id: str, image_path: str):
+    """
+    저장된 이미지 파일에 대해 AI 추론을 수행합니다.
+    
+    Args:
+        device_id: 디바이스 ID
+        image_path: 이미지 파일 경로
+        
+    Returns:
+        추론 결과 딕셔너리
+    """
+    try:
+        print(f"[AI] Starting inference for device {device_id}, image: {image_path}")
+        
+        # 이미지 파일 읽기
+        with open(image_path, 'rb') as f:
+            image_bytes = f.read()
+        
+        # 기본 plant_type 설정 (나중에 device별로 설정 가능하도록 확장 가능)
+        # 예: DB에서 device_id로 plant_type 조회
+        plant_type = "default"  # 기본값, 실제로는 DB나 설정에서 가져와야 함
+        
+        # device 정보에서 plant_type 가져오기 시도
+        device_info = get_device_by_device_id_any(device_id)
+        if device_info and device_info.get('plant_type'):
+            plant_type = device_info['plant_type']
+        
+        # model_manager를 사용하여 추론 수행
+        result = model_manager.predict(image_bytes, plant_type)
+        
+        # 타임스탬프 추가
+        result['timestamp'] = datetime.utcnow().isoformat()
+        result['device_id'] = device_id
+        result['plant_type'] = plant_type
+        
+        print(f"[AI] Inference completed for {device_id}: {result}")
+        return result
+        
+    except FileNotFoundError:
+        error_msg = f"Image file not found: {image_path}"
+        print(f"[AI] Error: {error_msg}")
+        return {
+            "error": error_msg,
+            "device_id": device_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        error_msg = f"Inference failed: {str(e)}"
+        print(f"[AI] Error: {error_msg}")
+        return {
+            "error": error_msg,
+            "device_id": device_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
 
 # --- 데이터 파이프라인 ---
 def process_incoming_data(topic: str, payload):

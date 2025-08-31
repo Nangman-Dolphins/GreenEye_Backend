@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
+from .chat_database import init_chat_db, save_message, load_history, get_user_conversations
+
 from .services import (
     initialize_services,
     mqtt_client,
@@ -298,6 +300,10 @@ def init_runtime_and_scheduler():
         print("[init] ⏳ init_db()...")
         init_db()
         print("[init] ✅ init_db() done")
+
+        print("[init] ⏳ init_chat_db()...")
+        init_chat_db()
+        print("[init] ✅ init_chat_db() done")
 
         scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Seoul")
 
@@ -774,6 +780,165 @@ def put_alert_thresholds():
                     th[key][k] = body[key][k]
     _save_thresholds(th)
     return jsonify(th)
+
+
+# --- Gemini API 관련 설정 ---
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+# base64 이미지 예시
+#{
+#    "prompt": "이 이미지에 대해 설명해주세요",
+#    "image": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
+#}
+# hex 이미지 예시
+#{
+#    "prompt": "이 이미지에 대해 설명해주세요",
+#    "image": "0xFFD8FFE000104A46494600010101006000600000FFDB00430008060607060508..."
+#}
+
+def hex_to_base64(hex_string):
+    """
+    HEX 문자열을 BASE64로 변환
+    """
+    try:
+        # HEX 문자열에서 '0x' 또는 '#' 제거
+        hex_string = hex_string.replace('0x', '').replace('#', '')
+        # HEX를 바이트로 변환
+        bytes_data = bytes.fromhex(hex_string)
+        # 바이트를 BASE64로 인코딩
+        base64_data = base64.b64encode(bytes_data).decode('utf-8')
+        return base64_data
+    except Exception as e:
+        print(f"HEX to BASE64 변환 에러: {str(e)}")
+        return None
+
+@app.route('/api/chat/gemini', methods=['POST'])
+@token_required
+def chat_with_gemini():
+    try:
+        data = request.get_json()
+        if not data or 'prompt' not in data:
+            return jsonify({"error": "메시지를 입력해주세요."}), 400
+
+        user_prompt = data.get('prompt')
+        image_data = data.get('image')
+        conversation_id = data.get('conversation_id', str(uuid.uuid4()))
+        current_user_id = g.current_user['id']
+
+        # --- 이미지 데이터 처리 (이 부분은 동일) ---
+        image_base64 = None
+        if image_data:
+            if isinstance(image_data, str):
+                if image_data.startswith('data:image'):
+                    image_base64 = image_data.split(',')[1] if ',' in image_data else image_data
+                else:
+                    image_base64 = hex_to_base64(image_data)
+
+        # 1. 사용자 메시지를 DB에 저장합니다.
+        save_message(conversation_id, current_user_id, 'user', user_prompt)
+        
+        # 2. 방금 저장한 메시지를 포함한 '전체' 대화 기록을 불러옵니다.
+        chat_history = load_history(conversation_id, current_user_id)
+        
+        # 3. '전체' 대화 기록을 Gemini API 형식으로 변환합니다.
+        contents = []
+        for i, (sender, message) in enumerate(chat_history):
+            role = 'user' if sender == 'user' else 'model'
+            
+            # 마지막 메시지(현재 사용자 메시지)에만 이미지를 추가합니다.
+            if i == len(chat_history) - 1 and image_base64:
+                parts = [
+                    {"text": message},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}
+                ]
+            else:
+                parts = [{"text": message}]
+            
+            contents.append({"role": role, "parts": parts})
+
+        # API 요청 준비
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.7,
+                "topK": 1,
+                "topP": 1
+            }
+        }
+        
+        headers = {'Content-Type': 'application/json'}
+
+        # Gemini API 호출 및 응답 처리 (이하 동일)
+        response = requests.post(GEMINI_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        gemini_response = response.json()
+        if 'candidates' not in gemini_response or not gemini_response['candidates']:
+            raise Exception("응답에 candidates가 없습니다.")
+            
+        answer = gemini_response['candidates'][0]['content']['parts'][0]['text']
+
+        save_message(conversation_id, current_user_id, 'model', answer)
+
+        return jsonify({
+            "answer": answer,
+            "conversation_id": conversation_id,
+        })
+
+    except Exception as e:
+        print(f"Gemini API 에러: {str(e)}")
+        return jsonify({"error": f"AI 응답을 받아오는데 실패했습니다: {str(e)}"}), 500
+
+
+@app.route('/api/chat/history', methods=['GET'])
+@token_required
+def get_chat_history():
+    """
+    사용자의 대화 기록을 조회하는 엔드포인트
+    - conversation_id: (선택) 특정 대화의 기록을 조회. 없으면 모든 대화 목록 반환
+    """
+    try:
+        current_user_id = g.current_user['id']
+        conversation_id = request.args.get('conversation_id')
+        
+        if conversation_id:
+            # 특정 대화의 전체 메시지 조회
+            messages = load_history(conversation_id, current_user_id)
+            if not messages:
+                return jsonify({
+                    "conversation_id": conversation_id,
+                    "messages": [],
+                    "message": "해당 대화의 기록이 없습니다."
+                })
+            return jsonify({
+                "conversation_id": conversation_id,
+                "messages": [
+                    {"role": role, "content": content}
+                    for role, content in messages
+                ]
+            })
+        else:
+            # 모든 대화 목록 조회
+            conversations = get_user_conversations(current_user_id)
+            if not conversations:
+                return jsonify({
+                    "conversations": [],
+                    "message": "대화 기록이 없습니다."
+                })
+            return jsonify({
+                "conversations": [
+                    {
+                        "id": conv_id,
+                        "last_update": last_update
+                    }
+                    for conv_id, last_update in conversations
+                ]
+            })
+    except Exception as e:
+        print(f"대화 기록 조회 에러: {str(e)}")
+        return jsonify({"error": "대화 기록을 불러오는데 실패했습니다."}), 500
+
 
 if __name__ == "__main__":
     with app.app_context():

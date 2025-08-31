@@ -1,0 +1,6 @@
+Canker
+Dehydrated
+Normal
+Rot
+Rust
+Sunburn

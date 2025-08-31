@@ -1,0 +1,4 @@
+Dried
+Fresh
+Spoiled
+Sunlight
