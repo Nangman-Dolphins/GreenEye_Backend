@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# setup_concurrent_mode.sh (v5)
-# Optimizes dnsmasq for potentially faster .local resolution.
+# setup_concurrent_mode.sh (v6)
+# Adds a second hostname alias for a dashboard.
 # Configures a Raspberry Pi for simultaneous AP+STA mode using systemd-networkd.
 
 # stop on any error
@@ -57,9 +57,9 @@ AP_PASSWORD="defaultPW"
 
 # set the new hostname
 hostnamectl set-hostname "${HOSTNAME}"
-# update the /etc/hosts file
-sed -i "s/127.0.1.1.*/127.0.1.1\t${HOSTNAME}/g" /etc/hosts
-echo "Hostname set to ${HOSTNAME}"
+# update the /etc/hosts file with both the primary name and the dashboard alias
+sed -i "s/127.0.1.1.*/127.0.1.1\t${HOSTNAME} ${HOSTNAME}-dashboard/g" /etc/hosts
+echo "Hostname set to ${HOSTNAME} with alias ${HOSTNAME}-dashboard"
 echo ""
 
 echo "--- 5. Creating network configuration files ---"
