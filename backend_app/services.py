@@ -561,65 +561,26 @@ def send_config_to_device(device_id: str, config_payload: dict):
         print(f"[warn] send_config_to_device received an empty payload for {device_id}.")
         return
 
-    to_send = {}
-    
-    # === high-level key translation ===
-    # translate 'mode' (e.g., 'normal', 'low') to 'pwr_mode' (e.g., 'M', 'L')
-    if 'mode' in config_payload:
-        mode_map = {"ultra_low": "Z", "low": "L", "normal": "M", "high": "H", "ultra_high": "U"}
-        raw_mode = str(config_payload['mode']).lower()
-        mode_char = mode_map.get(raw_mode)
-        if mode_char:
-            to_send['pwr_mode'] = mode_char
-            # set default night mode based on power mode
-            to_send['nht_mode'] = 1 if mode_char in ("M", "L", "Z") else 0
-
-    # translate 'flash_option' to 'flash_en' and 'flash_nt'
-    if 'flash_option' in config_payload:
-        flash_setting = FLASH_MAP.get(config_payload['flash_option'])
-        if flash_setting:
-            to_send.update(flash_setting)
-
-    # === low-level key validation and merge ===
-    # allows overriding high-level settings with specific low-level values
-    allowed_int = {
-        "flash_en": (0, 1),
-        "flash_nt": (0, 1),
-        "flash_level": (-1, 255),
-        "nht_mode": (0, 1)
-    }
-    allowed_str = {
-        "pwr_mode": {"Z", "L", "M", "H", "U"}
-    }
-
-    for k, v in config_payload.items():
-        if k in allowed_int:
-            lo, hi = allowed_int[k]
-            if isinstance(v, int) and lo <= v <= hi:
-                to_send[k] = v  # override if specified
-        elif k in allowed_str:
-            if isinstance(v, str) and v.upper() in allowed_str[k]:
-                to_send[k] = v.upper() # override if specified
-    
-    # ensure flash_level is always present, defaulting to -1
-    if 'flash_level' not in to_send:
-        to_send['flash_level'] = -1
-
-    if not to_send:
-        print(f"[error] Failed to create a valid config payload for {device_id} from input: {config_payload}")
+    if not isinstance(config_payload, dict) or not config_payload:
+        print(f"[error] received an invalid or empty payload for {device_id}: {config_payload}")
         return
 
-    topic = f"GreenEye/conf/{device_id}"
-    result = mqtt_client.publish(topic, json.dumps(to_send), qos=1, retain=True)
-    result.wait_for_publish()
-    print(f"Sent config to topic: {topic} payload={to_send}")
+    topic = f"GreenEye/gardening/{device_id}"
+    payload_str = json.dumps(config_payload)
 
-    # update redis cache if flash settings were part of the payload
-    if any(k in to_send for k in ("flash_en", "flash_nt", "flash_level")):
-        set_redis_data(
-            f"actuator_state:{device_id}:flash",
-            {"ts": datetime.utcnow().isoformat(), **to_send},
-        )
+    try:
+        # === publish the message with retain flag ===
+
+        info = mqtt_client.publish(topic, payload_str, qos=1, retain=True)
+        info.wait_for_publish(timeout=5) # wait for the message to be sent
+
+        if info.rc == 0:
+            print(f"successfully sent config to topic: {topic} payload={payload_str}")
+        else:
+            print(f"failed to send config to {topic}, return code: {info.rc}")
+
+    except Exception as e:
+        print(f"an exception occurred while publishing config for {device_id}: {e}")
 
         
 # --- MQTT 퍼블리시(앱에서 기대하는 공개 API) ---
