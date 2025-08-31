@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from werkzeug.utils import secure_filename
 import re
 import base64
+from PIL import Image, ImageEnhance
+from io import BytesIO
 
 
 import csv
@@ -446,7 +448,32 @@ def process_incoming_data(topic: str, payload):
                 image_base64 = payload.get("plant_img")
                 if image_base64 and isinstance(image_base64, str):
                     image_dec = base64.b64decode(image_base64)
-                    image_base16 = base64.b16encode(image_dec)
+
+                    brightness_factor = 1.2   # 20% brighter
+                    contrast_factor   = 1.2   # 20% more contrast
+                    saturation_factor = 3.0   # 300% more saturation
+                    sharpness_factor  = 1.3   # 30% more sharpness
+
+                    with Image.open(BytesIO(image_dec)) as img:
+                        # === apply enhancements sequentially ===
+                        enhancer = ImageEnhance.Brightness(img)
+                        img_enhanced = enhancer.enhance(brightness_factor)
+                        
+                        enhancer = ImageEnhance.Contrast(img_enhanced)
+                        img_enhanced = enhancer.enhance(contrast_factor)
+                        
+                        enhancer = ImageEnhance.Color(img_enhanced)
+                        img_enhanced = enhancer.enhance(saturation_factor)
+
+                        enhancer = ImageEnhance.Sharpness(img_enhanced)
+                        img_enhanced = enhancer.enhance(sharpness_factor)
+                    
+                    buffer = BytesIO()
+                    img_enhanced.save(buffer, 'JPEG', quality=100)
+                    enhanced_image_bytes = buffer.getvalue()
+
+
+                    image_base16 = base64.b16encode(enhanced_image_bytes)
                     image_base16_str = image_base16.decode('UTF-8')
 
                     filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -539,10 +566,9 @@ def process_incoming_data(topic: str, payload):
 def send_mode_to_device(device_id: str, 
                         mode_char: str,
                         night_option: str ):
-    # 모드 프리셋(간단히 기본값; 기존에 프리셋 딕셔너리가 있으면 그걸 재사용)
     mode = (mode_char or "M").upper()[:1]
     nht = 1 if night_option == "night_on" else 0
-    # 일반적으로 M/L/Z는 야간모드 1, H/U는 0으로 운용 (기존 로직과 맞추세요)
+    
     base = {"pwr_mode": mode, "nht_mode": nht}
 
     payload = dict(base)

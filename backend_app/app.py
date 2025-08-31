@@ -515,12 +515,12 @@ def control_device_by_mode(device_id: str):
     if not mode_char:
         return jsonify({"error": "Invalid 'mode'. Use one of Z/L/M/H/U or ultra_low/low/normal/high/ultra_high."}), 400
 
-    # 2) 플래시 옵션/레벨 추가로 수신 (옵션 키 이름은 프론트에서 쓰는 값에 맞춰 둘 다 허용)
-    flash_option = data.get("flash_option") or data.get("night_flash_mode")  # "always_on" | "always_off" | "night_off"
-    flash_level  = data.get("flash_level")  # 0~255 정수 (미지정이면 그대로 None)
+    # 야간 플래시를 야간 모드로 통합
+    night_option = data.get("night_option")
+    #flash_level  = data.get("flash_level")  # 0~255 정수 (미지정이면 그대로 None)
 
     try:
-        applied = send_mode_to_device(device_id, mode_char, flash_option=flash_option, flash_level=flash_level)
+        applied = send_mode_to_device(device_id, mode_char, night_option=night_option)
         return jsonify({"status":"success", "device_id": device_id, "mode": mode_char, "applied_config": applied})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
