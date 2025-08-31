@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# setup_concurrent_mode.sh (v6)
-# Adds a second hostname alias for a dashboard.
+# setup_concurrent_mode.sh (v8)
+# Fixes /etc/hosts duplication and ensures /etc/nsswitch.conf is correct for mDNS.
 # Configures a Raspberry Pi for simultaneous AP+STA mode using systemd-networkd.
 
 # stop on any error
@@ -43,8 +43,19 @@ fi
 
 # ** DNS FIX **
 # Force the system to use DNS servers provided by systemd-resolved.
-# This ensures DNS from DHCP on wlan0 is used for internet access.
 ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+
+# ** mDNS FIX **
+# ensure nsswitch.conf is configured for mdns
+NSS_CONFIG="/etc/nsswitch.conf"
+HOSTS_LINE="hosts: files mdns4_minimal [NOTFOUND=return] dns mdns4"
+if ! grep -q "^hosts:.*mdns4_minimal" "$NSS_CONFIG"; then
+  echo "Fixing /etc/nsswitch.conf for .local resolution..."
+  # remove any existing hosts line
+  sed -i '/^hosts:/d' "$NSS_CONFIG"
+  # add the correct line to the top
+  sed -i "1i ${HOSTS_LINE}" "$NSS_CONFIG"
+fi
 
 echo "Core network services enabled and configured for DNS."
 echo ""
@@ -57,8 +68,8 @@ AP_PASSWORD="defaultPW"
 
 # set the new hostname
 hostnamectl set-hostname "${HOSTNAME}"
-# update the /etc/hosts file with both the primary name and the dashboard alias
-sed -i "s/127.0.1.1.*/127.0.1.1\t${HOSTNAME} ${HOSTNAME}-dashboard/g" /etc/hosts
+# use a robust sed command to replace the 127.0.1.1 line, preventing duplicates
+sed -i "/^127.0.1.1/c\127.0.1.1\t${HOSTNAME} ${HOSTNAME}-dashboard" /etc/hosts
 echo "Hostname set to ${HOSTNAME} with alias ${HOSTNAME}-dashboard"
 echo ""
 
@@ -149,7 +160,6 @@ echo "--- 9. Creating the WiFi configuration web portal ---"
 mkdir -p /opt/wifi_portal
 
 # Use a heredoc to write the python script directly to the file.
-# This is safer than using an intermediate variable with echo.
 cat > /opt/wifi_portal/app.py << 'EOF'
 import subprocess
 from flask import Flask, render_template_string, request
@@ -166,6 +176,9 @@ HTML_TEMPLATE_FORM = '''
         body { font-family: Arial, sans-serif; margin: 20px; background-color: #f0f2f5; }
         .container { max-width: 500px; margin: auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 15px rgba(0,0,0,0.1); }
         h2 { text-align: center; color: #333; }
+        .label-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: -10px; }
+        a.refresh-btn { font-size: 14px; text-decoration: none; color: #007bff; }
+        a.refresh-btn:hover { text-decoration: underline; }
         select, input, button { width: 100%; padding: 12px; margin: 10px 0; display: inline-block; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; }
         button { background-color: #007bff; color: white; cursor: pointer; border: none; font-size: 16px; }
         button:hover { background-color: #0056b3; }
@@ -175,7 +188,10 @@ HTML_TEMPLATE_FORM = '''
     <div class="container">
         <h2>Wi-Fi 연결 설정</h2>
         <form action="/save" method="post">
-            <label for="ssid">Wi-Fi 네트워크 선택:</label>
+            <div class="label-container">
+                <label for="ssid">Wi-Fi 네트워크 선택:</label>
+                <a href="/" class="refresh-btn">새로고침</a>
+            </div>
             <select id="ssid" name="ssid">
                 {% for network in networks %}
                 <option value="{{ network }}">{{ network }}</option>
@@ -213,11 +229,12 @@ HTML_TEMPLATE_SUCCESS = '''
 '''
 
 def get_wifi_ssids():
-    try:
+    try
+        # run a scan to get the latest list
         cmd_output = subprocess.check_output(['iwlist', 'wlan0', 'scan'])
         output_str = cmd_output.decode('utf-8')
         ssids = set()
-        for line in output_str.split('\\n'):
+        for line in output_str.split('\n'):
             if 'ESSID:"' in line:
                 ssid = line.split('ESSID:"')[1].split('"')[0]
                 if ssid:
@@ -227,9 +244,7 @@ def get_wifi_ssids():
         return []
 
 def save_wifi_credentials(ssid, password):
-    # wpa_passphrase generates a complete and correct network block.
-    # This is a much safer method than building it manually.
-    try:
+    try
         network_block = subprocess.check_output(['wpa_passphrase', ssid, password]).decode('utf-8')
     except subprocess.CalledProcessError:
         return False
