@@ -447,6 +447,7 @@ def process_incoming_data(topic: str, payload):
                 if image_base64 and isinstance(image_base64, str):
                     image_dec = base64.b64decode(image_base64)
                     image_base16 = base64.b16encode(image_dec)
+                    image_base16_str = image_base16.decode('UTF-8')
 
                     filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
                     filename_jpg = f"{filename}.jpg"
@@ -460,7 +461,7 @@ def process_incoming_data(topic: str, payload):
                     with open(path_jpg, "wb") as f:
                         f.write(image_dec)
                     with open(path_origin, "w", encoding="utf-8") as f:
-                        f.write(image_base16)
+                        f.write(image_base16_str)
 
                     if mac:
                         try:
