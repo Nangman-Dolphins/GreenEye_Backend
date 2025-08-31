@@ -378,6 +378,19 @@ def run_inference_on_image(device_id: str, image_path: str):
         
         # model_manager를 사용하여 추론 수행
         result = model_manager.predict(image_bytes, plant_type)
+
+        if "error" in result:
+            result['comment'] = get_plant_comment("_error")
+        else:
+            predicted_label = result.get("predicted_label", "")
+            
+            # 1. 주요 키 (e.g., "Rose_healthy")
+            specific_key = f"{plant_type}_{predicted_label}"
+            
+            # 2. 대체 키 (e.g., "healthy")는 predicted_label 자체
+            
+            # 수정된 함수 호출
+            result['comment'] = get_plant_comment(primary_key=specific_key, fallback_key=predicted_label)
         
         # 타임스탬프 추가
         result['timestamp'] = datetime.utcnow().isoformat()
@@ -400,6 +413,7 @@ def run_inference_on_image(device_id: str, image_path: str):
         print(f"[AI] Error: {error_msg}")
         return {
             "error": error_msg,
+            "comment": get_plant_comment("_error"), # 예외 발생 시에도 에러 코멘트 추가
             "device_id": device_id,
             "timestamp": datetime.utcnow().isoformat()
         }
@@ -736,3 +750,42 @@ def parse_csv_result(decoded_csv: str):
     if rows:
         print(f"[DEBUG] parsed_sample_keys={list(rows[0].keys())}")
     return rows
+
+# --- 한줄평 로더 (추가) ---
+_comment_cache = {}
+
+def get_plant_comment(primary_key: str = None, fallback_key: str = None) -> str:
+    """
+    AI가 예측한 레이블을 기반으로 사용자 친화적인 한줄평을 반환합니다.
+    JSON 파일을 읽고 그 내용을 캐시에 저장하여 성능을 최적화합니다.
+    """
+    global _comment_cache
+
+    if not _comment_cache:
+        try:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            comment_file_path = os.path.join(current_dir, 'plant_comments.json')
+            with open(comment_file_path, 'r', encoding='utf-8') as f:
+                _comment_cache = json.load(f)
+            print("[INFO] Plant comments loaded successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to load plant_comments.json: {e}")
+            _comment_cache = {
+                "_default": "분석 결과를 확인해주세요.",
+                "_error": "분석 중 오류가 발생했습니다."
+            }
+
+    # 1. 주요 키 (e.g., "Rose_healthy")로 먼저 검색
+    if primary_key:
+        comment = _comment_cache.get(primary_key)
+        if comment:
+            return comment
+
+    # 2. 주요 키가 없을 경우, 대체 키 (e.g., "healthy")로 검색
+    if fallback_key:
+        comment = _comment_cache.get(fallback_key)
+        if comment:
+            return comment
+
+    # 3. 두 키 모두 없을 경우, 기본 메시지 반환
+    return _comment_cache.get("_default", "분석 결과를 확인해주세요.")

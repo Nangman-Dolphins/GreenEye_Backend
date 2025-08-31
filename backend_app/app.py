@@ -797,22 +797,6 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemin
 #    "image": "0xFFD8FFE000104A46494600010101006000600000FFDB00430008060607060508..."
 #}
 
-def hex_to_base64(hex_string):
-    """
-    HEX 문자열을 BASE64로 변환
-    """
-    try:
-        # HEX 문자열에서 '0x' 또는 '#' 제거
-        hex_string = hex_string.replace('0x', '').replace('#', '')
-        # HEX를 바이트로 변환
-        bytes_data = bytes.fromhex(hex_string)
-        # 바이트를 BASE64로 인코딩
-        base64_data = base64.b64encode(bytes_data).decode('utf-8')
-        return base64_data
-    except Exception as e:
-        print(f"HEX to BASE64 변환 에러: {str(e)}")
-        return None
-
 @app.route('/api/chat/gemini', methods=['POST'])
 @token_required
 def chat_with_gemini():
@@ -829,11 +813,12 @@ def chat_with_gemini():
         # --- 이미지 데이터 처리 (이 부분은 동일) ---
         image_base64 = None
         if image_data:
-            if isinstance(image_data, str):
-                if image_data.startswith('data:image'):
-                    image_base64 = image_data.split(',')[1] if ',' in image_data else image_data
-                else:
-                    image_base64 = hex_to_base64(image_data)
+            # 데이터 URI 형식(e.g., "data:image/jpeg;base64,...")인 경우, 순수 Base64 부분만 추출
+            if image_data.startswith('data:image'):
+                image_base64 = image_data.split(',')[1]
+            else:
+                # 이미 순수 Base64 문자열인 경우, 그대로 사용
+                image_base64 = image_data
 
         # 1. 사용자 메시지를 DB에 저장합니다.
         save_message(conversation_id, current_user_id, 'user', user_prompt)
