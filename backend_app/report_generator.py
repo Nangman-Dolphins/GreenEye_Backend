@@ -20,7 +20,7 @@ from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
 from dotenv import load_dotenv
-from .services import connect_influxdb, query_influxdb_data
+from .services import connect_influxdb, query_influxdb_data, get_influx_client
 from .database import get_db_connection, get_all_devices_any, get_all_users, get_device_by_device_id_any
 from pathlib import Path
 import pandas as pd
@@ -295,125 +295,73 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     story = []
 
     from reportlab.lib.styles import ParagraphStyle
-
     base_font = 'NotoSansKR' if os.path.exists(font_path) else 'Helvetica'
     styles.add(ParagraphStyle(name='NotoTitle',    parent=styles['Title'],    fontName=base_font))
     styles.add(ParagraphStyle(name='NotoNormal',   parent=styles['Normal'],   fontName=base_font))
     styles.add(ParagraphStyle(name='NotoHeading4', parent=styles['Heading4'], fontName=base_font))
-        
-    # if not room:
-    #     # DB에서 room 가져오기
-    #     try:
-    #         from .database import get_device_by_device_id_any
-    #         dev = get_device_by_device_id_any(device_id) or {}
-    #         room = dev.get("room")
-    #     except Exception:
-    #         room = None
-    # print(f"[DEBUG] room resolved to: {room!r}")
-    
+
+    # 제목/메타
     story.append(Paragraph(f"<b>GreenEye 주간 식물 보고서 - {friendly_name} ({device_id})</b>", styles['NotoTitle']))
-    
     story.append(Paragraph(f"기간: {start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}", styles['NotoNormal']))
-    
     if plant_type:
         story.append(Paragraph(f"식물 종류: {plant_type}", styles['NotoNormal']))
-    
-    # --- 배터리 상태 문자열 함수: 사용 전에 정의 ---
-    def battery_status_string(level):
-        if level is None:
-            return "데이터 없음"
-        elif level >= 65:
-            return f"양호 ({level:.2f}%)"
-        elif level >= 40:
-            return f"낮음 ({level:.2f}%)"
-        elif level >= 15:
-            return f"매우 낮음 ({level:.2f}%)"
-        else:
-            return f"위험 ({level:.2f}%)"
-    
     story.append(Paragraph(f"위치: {room or '(미설정)'}", styles['NotoNormal']))
-    
-    room = None
-    
+    story.append(Spacer(1, 0.3*cm))
+
+    # 배터리 상태 포맷터
+    def battery_status_string(level):
+        if level is None: return "데이터 없음"
+        if level >= 65:  return f"양호 ({level:.2f}%)"
+        if level >= 40:  return f"낮음 ({level:.2f}%)"
+        if level >= 15:  return f"매우 낮음 ({level:.2f}%)"
+        return f"위험 ({level:.2f}%)"
+
+    # Influx 쿼리
     start = _fmt_iso_utc(start_dt)
-    end = _fmt_iso_utc(end_dt)
-    plant_id = device_id
-    
+    end   = _fmt_iso_utc(end_dt)
     query = f"""
     from(bucket: "{INFLUXDB_BUCKET}")
     |> range(start: {start}, stop: {end})
     |> filter(fn: (r) => r["_measurement"] == "sensor_readings")
-    |> filter(fn: (r) => r["device_id"] == "{plant_id}")  // ← 중요: plant_id가 사실은 device_id
+    |> filter(fn: (r) => r["device_id"] == "{device_id}")
     |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
     |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
-    |> keep(columns: ["_time", "device_id", "temperature", "humidity", "light_lux", "soil_moisture", "soil_temp", "soil_ec", "battery"])
+    |> keep(columns: ["_time","device_id","temperature","humidity","light_lux","soil_moisture","soil_temp","soil_ec","battery"])
     """
-
-    rows = query_influxdb_data(query)
-    if rows is None:
-        print("[DEBUG] InfluxDB 쿼리 실패 또는 데이터 없음 → rows=None")
-        story.append(Paragraph("이 기간 동안의 센서 데이터를 가져올 수 없습니다.", styles['NotoNormal']))
-        doc.build(story)
-        return filepath
-
-    print(f"[DEBUG] {len(rows)} rows fetched from InfluxDB")
-    for i, r in enumerate(rows[:5]):
-        print(f"[DEBUG] Row {i}: {r}")
-
-
+    rows = query_influxdb_data(query)  # 성공적으로 데이터 가져옴/없음 처리 포함  :contentReference[oaicite:9]{index=9}
     if not rows:
-        story.append(Paragraph("이 기간 동안의 센서 데이터가 없습니다.", styles['NotoNormal']))
+        story.append(Paragraph("이 기간 동안의 센서 데이터를 가져올 수 없거나, 데이터가 없습니다.", styles['NotoNormal']))
         doc.build(story)
         return filepath
 
-    # ── 숫자/시간 타입 정규화 ─────────────────────────────
-    num_fields = ["temperature","humidity","light_lux","soil_moisture","soil_temp","soil_ec","battery"]
+    # 숫자/시간 정규화
     def _to_float(v):
-        try:
-            return float(v)
-        except Exception:
-            return None
+        try: return float(v)
+        except: return None
     for r in rows:
-        for k in num_fields:
+        for k in ["temperature","humidity","light_lux","soil_moisture","soil_temp","soil_ec","battery"]:
             if r.get(k) is not None:
                 r[k] = _to_float(r[k])
         if r.get("_time") is not None and not isinstance(r["_time"], datetime):
-            r["_time"] = datetime.fromisoformat(str(r["_time"]).replace("Z", "+00:00"))
+            r["_time"] = datetime.fromisoformat(str(r["_time"]).replace("Z","+00:00"))
 
-    def pick(key):
-        return [r.get(key) for r in rows if r.get(key) is not None]
+    def pick(key): return [r.get(key) for r in rows if r.get(key) is not None]
+    def avg(values): return sum(v for v in values if v is not None)/len(values) if values else 0
 
-    def avg(values):
-        return sum(float(v) for v in values) / len(values) if values else 0
-
-    # 최근값(가장 최신 non-null) 헬퍼
+    # 최신 배터리/최근값
     def last_value(key):
         for r in sorted(rows, key=lambda x: x.get("_time") or datetime.min, reverse=True):
             v = r.get(key)
-            if v is not None:
-                return v
+            if v is not None: return v
         return None
+    latest_battery = last_value("battery")
 
+    # 배터리 상태
+    story.append(Paragraph(f"배터리 상태: {battery_status_string(latest_battery)}", styles['NotoNormal']))
+    story.append(Spacer(1, 0.4*cm))
 
-    # 5) 최신 배터리 값 계산 (가장 최근 non-null, float)
-    latest_battery = None
-    if rows:
-        for r in sorted(rows, key=lambda x: x.get("_time") or datetime.min):
-            if r.get("battery") is not None:
-                latest_battery = r["battery"]  # 이미 float
-
-    # 배터리 상태 라인 추가
-    story.append(Paragraph(
-        f"배터리 상태: {battery_status_string(latest_battery)}",
-        styles['NotoNormal']
-    ))
-    story.append(Spacer(1, 0.4 * cm))
-
-    # 📊 평균 + 최근값 테이블
+    # 평균/최근값 표
     story.append(Paragraph("센서 요약 (평균값 & 최근값)", styles['NotoHeading4']))
-    table_data = [["항목", "평균값", "최근값"]]
-
-    # 최근값 미리 계산 + 문자열 포맷(빈 값 안전 처리)
     def fmt(v): return "N/A" if v is None else f"{float(v):.2f}"
     last = {
         "temperature":   last_value("temperature"),
@@ -423,7 +371,8 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         "soil_moisture": last_value("soil_moisture"),
         "soil_ec":       last_value("soil_ec"),
     }
-    table_data += [
+    table_data = [
+        ["항목","평균값","최근값"],
         ["주변 온도 (°C)",     f"{avg(pick('temperature')):.2f}",   fmt(last["temperature"])],
         ["주변 습도 (%)",       f"{avg(pick('humidity')):.2f}",      fmt(last["humidity"])],
         ["주변 조도 (lux)",     f"{avg(pick('light_lux')):.2f}",     fmt(last["light_lux"])],
@@ -431,66 +380,76 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ["토양 수분 (%)",       f"{avg(pick('soil_moisture')):.2f}", fmt(last["soil_moisture"])],
         ["토양 전도도 (uS/cm)", f"{avg(pick('soil_ec')):.2f}",       fmt(last["soil_ec"])],
     ]
-    avg_table = Table(table_data, colWidths=[6*cm, 4*cm, 4*cm])
+    avg_table = Table(table_data, colWidths=[6*cm,4*cm,4*cm])
     avg_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, -1), base_font),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('BACKGROUND',(0,0),(-1,0),colors.grey),
+        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+        ('ALIGN',(0,0),(-1,-1),'CENTER'),
+        ('FONTNAME',(0,0),(-1,-1),base_font),
+        ('FONTSIZE',(0,0),(-1,-1),10),
+        ('BOTTOMPADDING',(0,0),(-1,0),12),
+        ('GRID',(0,0),(-1,-1),1,colors.black),
     ]))
     story.append(avg_table)
-    story.append(Spacer(1, 0.5 * cm))
+    story.append(Spacer(1, 0.5*cm))
 
-    # 표준 범위 테이블 준비
-    standards_df = load_standards()
+    # 표준범위 로딩
+    standards_df = load_standards()  # 엑셀 -> min/max 컬럼으로 정규화  :contentReference[oaicite:10]{index=10}
 
+    # 항목별 그래프 + 범위 비교 문장
     field_labels = [
-        ("temperature", "주변 온도 (°C)"),
-        ("humidity", "주변 습도 (%)"),
-        ("light_lux", "조도 (lux)"),
-        ("soil_temp", "토양 온도 (°C)"),
-        ("soil_moisture", "토양 수분 (%)"),
-        ("soil_ec", "토양 전도도 (uS/cm)"),
+        ("temperature","주변 온도 (°C)"),
+        ("humidity","주변 습도 (%)"),
+        ("light_lux","조도 (lux)"),
+        ("soil_temp","토양 온도 (°C)"),
+        ("soil_moisture","토양 수분 (%)"),
+        ("soil_ec","토양 전도도 (uS/cm)"),
     ]
-
     for field, label in field_labels:
         img_buf = generate_graph_image(rows, field, label)
+        if not img_buf:
+            continue
+        story.append(Paragraph(label, styles['NotoHeading4']))
+        story.append(Image(img_buf, width=15*cm, height=5*cm))
 
-        if img_buf:
-            story.append(Paragraph(label, styles['NotoHeading4']))
-            img = Image(img_buf, width=15*cm, height=5*cm)
-            story.append(img)
-            # ▼▼▼ 정상 범위 비교 문장 생성 ▼▼▼
-            # 그래프에 사용된 동일 데이터 재활용
-            times, values = [], []
-            for r in rows:
-                v = r.get(field)
-                if v is None: 
-                    continue
-                t = r.get("_time")
-                if not isinstance(t, datetime) and t is not None:
-                    t = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
-                times.append(t); values.append(_to_float(v))
-            lo, hi = get_range(standards_df, plant_type, field)
-            intervals = find_out_of_range_intervals(times, values, lo, hi)
+        # 범위 비교 설명
+        t_list, v_list = [], []
+        for r in rows:
+            v = r.get(field)
+            if v is None: 
+                continue
+            t = r.get("_time")
+            t = t if isinstance(t, datetime) else datetime.fromisoformat(str(t).replace("Z","+00:00"))
+            t_list.append(t); v_list.append(_to_float(v))
 
-            # 문장 렌더
-            if lo is None and hi is None:
-                story.append(Paragraph("※ 이 항목의 정상 범위를 찾을 수 없어 비교를 생략했습니다.", styles['NotoNormal']))
-            elif not intervals:
-                story.append(Paragraph("이번 주 이 항목은 대부분 정상 범위였습니다.", styles['NotoNormal']))
-            else:
-                for st, ed, kind in intervals:
-                    kind_ko = "높았습니다" if kind == "high" else "낮았습니다"
-                    story.append(Paragraph(
-                        f"{st.strftime('%Y-%m-%d %H:%M')} ~ {ed.strftime('%Y-%m-%d %H:%M')} 동안 정상 범위보다 {kind_ko}.", 
-                        styles['NotoNormal']
-                    ))
-            story.append(Spacer(1, 0.5 * cm))
+        lo, hi = get_range(standards_df, plant_type, field)  # 식물종에 맞춘 범위 찾기  :contentReference[oaicite:11]{index=11}
+        intervals = find_out_of_range_intervals(t_list, v_list, lo, hi)
 
+        if lo is None and hi is None:
+            story.append(Paragraph("※ 이 항목의 정상 범위를 찾을 수 없어 비교를 생략했습니다.", styles['NotoNormal']))
+        elif not intervals:
+            rng = ""
+            if lo is not None or hi is not None:
+                lo_s = f"{lo:.0f}" if lo is not None else "-"
+                hi_s = f"{hi:.0f}" if hi is not None else "-"
+                rng = f" (정상범위 {lo_s}–{hi_s})"
+            story.append(Paragraph(f"이번 주 이 항목은 대부분 정상 범위였습니다{rng}.", styles['NotoNormal']))
+        else:
+            # 구간 요약
+            segs = []
+            for s, e, kind in intervals:
+                kind_ko = "상한 초과" if kind=="high" else "하한 미만"
+                segs.append(f"{s.strftime('%m/%d %H:%M')}–{e.strftime('%m/%d %H:%M')} ({kind_ko})")
+            lo_s = f"{lo:.0f}" if lo is not None else "-"
+            hi_s = f"{hi:.0f}" if hi is not None else "-"
+            story.append(Paragraph(
+                f"정상범위 {lo_s}–{hi_s} 기준으로 다음 구간에서 벗어났습니다: " + ", ".join(segs),
+                styles['NotoNormal']
+            ))
+
+        story.append(Spacer(1, 0.4*cm))
+
+    # PDF 저장
     doc.build(story)
     return filepath
 
@@ -527,7 +486,7 @@ def send_all_reports():
     print(f"\n--- PDF 보고서 전송 시작: {datetime.now()} ---")
     users = get_all_users()
     devices = get_all_devices_any()
-    now = datetime.now().astimezone(pytz.utc)  # ✅ 로컬시간 -> UTC로 변환
+    now = datetime.now().astimezone(pytz.utc)  # 로컬시간 -> UTC로 변환
     # 주간 리포트
     start = now - timedelta(days=7)
 
@@ -549,3 +508,11 @@ def send_all_reports():
 
 if __name__ == "__main__":
     send_all_reports()
+    # --- InfluxDB 클라이언트 정리 ---
+    try:
+        cli = get_influx_client()
+        if cli:
+            cli.close()
+            print("[INFO] InfluxDB client closed cleanly.")
+    except Exception as e:
+        print(f"[WARN] Influx client close failed: {e}")
