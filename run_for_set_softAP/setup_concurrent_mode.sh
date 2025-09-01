@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# setup_concurrent_mode.sh (v8)
-# Fixes /etc/hosts duplication and ensures /etc/nsswitch.conf is correct for mDNS.
-# Configures a Raspberry Pi for simultaneous AP+STA mode using systemd-networkd.
+# setup_concurrent_mode.sh (v10 - Final)
+# This version is confirmed to be safe for Docker environments.
+# It only disables host-level webservers (nginx, apache2) and does not affect the Docker service.
 
 # stop on any error
 set -e
@@ -13,6 +13,27 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+echo "--- 0. Disabling Conflicting Host Services ---"
+# Note: This does NOT affect the Docker service or containers.
+# It only disables webservers running directly on the host OS that conflict on port 80.
+if systemctl list-units --type=service | grep -q 'nginx.service'; then
+  echo "Disabling conflicting host nginx service..."
+  systemctl stop nginx.service
+  systemctl disable nginx.service
+fi
+if systemctl list-units --type=service | grep -q 'apache2.service'; then
+  echo "Disabling conflicting host apache2 service..."
+  systemctl stop apache2.service
+  systemctl disable apache2.service
+fi
+# Switch to systemd-networkd by disabling other network managers
+systemctl stop NetworkManager 2>/dev/null || true
+systemctl disable NetworkManager 2>/dev/null || true
+systemctl stop dhcpcd 2>/dev/null || true
+systemctl disable dhcpcd 2>/dev/null || true
+echo "Conflicting host services disabled."
+echo ""
+
 echo "--- 1. Installing necessary packages ---"
 apt update
 # Add systemd-resolved to ensure DNS service is available
@@ -20,16 +41,7 @@ apt install hostapd dnsmasq python3-flask systemd-resolved -y
 echo "Packages installed."
 echo ""
 
-echo "--- 2. Disabling conflicting network services ---"
-# switch to systemd-networkd by disabling other managers
-systemctl stop NetworkManager 2>/dev/null || true
-systemctl disable NetworkManager 2>/dev/null || true
-systemctl stop dhcpcd 2>/dev/null || true
-systemctl disable dhcpcd 2>/dev/null || true
-echo "Conflicting services disabled."
-echo ""
-
-echo "--- 3. Enabling and Configuring Core Network Services ---"
+echo "--- 2. Enabling and Configuring Core Network Services ---"
 # enable the services we need
 systemctl enable systemd-networkd
 systemctl enable systemd-resolved
@@ -60,7 +72,7 @@ fi
 echo "Core network services enabled and configured for DNS."
 echo ""
 
-echo "--- 4. Setting up hostname ---"
+echo "--- 3. Setting up hostname ---"
 # get last 4 characters of the mac address
 MAC_SUFFIX=$(cat /sys/class/net/wlan0/address | sed 's/://g' | cut -c 9-12)
 HOSTNAME="ge-ccu-${MAC_SUFFIX}"
@@ -69,11 +81,14 @@ AP_PASSWORD="defaultPW"
 # set the new hostname
 hostnamectl set-hostname "${HOSTNAME}"
 # use a robust sed command to replace the 127.0.1.1 line, preventing duplicates
-sed -i "/^127.0.1.1/c\127.0.1.1\t${HOSTNAME} ${HOSTNAME}-dashboard" /etc/hosts
+# remove existing line first to be safe
+sed -i "/^127.0.1.1/d" /etc/hosts
+# add the new, correct line
+echo "127.0.1.1	${HOSTNAME} ${HOSTNAME}-dashboard" >> /etc/hosts
 echo "Hostname set to ${HOSTNAME} with alias ${HOSTNAME}-dashboard"
 echo ""
 
-echo "--- 5. Creating network configuration files ---"
+echo "--- 4. Creating network configuration files ---"
 
 # create a service to set up the virtual interface for the ap
 cat > /etc/systemd/system/create_ap_interface.service << EOF
@@ -81,12 +96,10 @@ cat > /etc/systemd/system/create_ap_interface.service << EOF
 Description=Create AP virtual interface (uap0)
 After=sys-subsystem-net-devices-wlan0.device
 Before=systemd-networkd.service
-
 [Service]
 Type=oneshot
 ExecStart=/sbin/iw dev wlan0 interface add uap0 type __ap
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -95,15 +108,12 @@ EOF
 cat > /etc/systemd/network/wlan0.network << EOF
 [Match]
 Name=wlan0
-
 [Network]
 DHCP=yes
 EOF
-
 cat > /etc/systemd/network/uap0.network << EOF
 [Match]
 Name=uap0
-
 [Network]
 Address=192.168.5.1/24
 DHCPServer=no
@@ -111,20 +121,19 @@ EOF
 echo "systemd-networkd files created."
 echo ""
 
-echo "--- 6. Configuring wpa_supplicant for STA mode ---"
+echo "--- 5. Configuring wpa_supplicant for STA mode ---"
 # create an initial, empty config file for wlan0
 cat > /etc/wpa_supplicant/wpa_supplicant-wlan0.conf << EOF
 ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
 update_config=1
 country=US
 EOF
-
 # enable the wpa_supplicant service for wlan0
 systemctl enable wpa_supplicant@wlan0.service
 echo "wpa_supplicant configured."
 echo ""
 
-echo "--- 7. Configuring hostapd for AP mode ---"
+echo "--- 6. Configuring hostapd for AP mode ---"
 cat > /etc/hostapd/hostapd.conf << EOF
 interface=uap0
 ssid=${HOSTNAME}
@@ -142,7 +151,7 @@ systemctl enable hostapd.service
 echo "hostapd configured."
 echo ""
 
-echo "--- 8. Configuring dnsmasq for AP DHCP ---"
+echo "--- 7. Configuring dnsmasq for AP DHCP ---"
 cat > /etc/dnsmasq.conf << EOF
 interface=uap0
 dhcp-range=192.168.5.10,192.168.5.50,12h
@@ -155,7 +164,7 @@ systemctl enable dnsmasq.service
 echo "dnsmasq configured."
 echo ""
 
-echo "--- 9. Creating the WiFi configuration web portal ---"
+echo "--- 8. Creating the WiFi configuration web portal ---"
 # create directory for the web app
 mkdir -p /opt/wifi_portal
 
@@ -229,7 +238,7 @@ HTML_TEMPLATE_SUCCESS = '''
 '''
 
 def get_wifi_ssids():
-    try
+    try:
         # run a scan to get the latest list
         cmd_output = subprocess.check_output(['iwlist', 'wlan0', 'scan'])
         output_str = cmd_output.decode('utf-8')
@@ -244,7 +253,7 @@ def get_wifi_ssids():
         return []
 
 def save_wifi_credentials(ssid, password):
-    try
+    try:
         network_block = subprocess.check_output(['wpa_passphrase', ssid, password]).decode('utf-8')
     except subprocess.CalledProcessError:
         return False
@@ -291,13 +300,11 @@ cat > /etc/systemd/system/wifi-portal.service <<EOF
 [Unit]
 Description=WiFi Configuration Portal
 After=network.target
-
 [Service]
 ExecStart=/usr/bin/python3 /opt/wifi_portal/app.py
 WorkingDirectory=/opt/wifi_portal
 Restart=always
 User=root
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -306,7 +313,7 @@ systemctl enable wifi-portal.service
 echo "Web portal created and enabled."
 echo ""
 
-echo "--- 10. Enabling all services ---"
+echo "--- 9. Enabling all services ---"
 systemctl enable create_ap_interface.service
 # enable avahi for .local address resolution
 systemctl enable avahi-daemon.service
