@@ -58,9 +58,8 @@ openpyxl
 
 
 # PyTorch (CPU 전용)
-
-torch==2.8.0+cpu
-
+# auto find cpu vision from extra url
+torch==2.8.0
 torchvision==0.23.0
 
 
