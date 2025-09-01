@@ -13,6 +13,7 @@ services:
       # 로컬 폴더 ↔ 컨테이너 경로 (바인드 마운트)
       - ./backend_app/images:/app/backend_app/images
       - ./data:/app/data
+      - ./backend_app/uploads:/app/backend_app/uploads
     env_file:
       - .env
     environment:
