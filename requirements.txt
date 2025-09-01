@@ -1,5 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
+send2trash==1.8.3
 APScheduler==3.11.0
 bidict==0.23.1
 blinker==1.9.0
@@ -57,10 +58,9 @@ openpyxl
 
 
 # PyTorch (CPU 전용)
-
-torch==2.8.0+cpu
-
-torchvision==0.23.0+cpu
+# auto find cpu vision from extra url
+torch==2.8.0
+torchvision==0.23.0
 
 
 # 이미지 처리
