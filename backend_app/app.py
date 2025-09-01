@@ -56,6 +56,10 @@ from backend_app.standards_loader import classify_payload
 load_dotenv()
 app = Flask(__name__)
 
+# 채팅 이미지 저장을 위한 폴더 경로를 정의합니다.
+CHAT_IMAGE_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), "uploads", "chat_images")
+os.makedirs(CHAT_IMAGE_FOLDER, exist_ok=True) # 폴더가 없으면 생성
+
 ENV = os.getenv("FLASK_ENV", "production").lower()
 SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY")
 if not SECRET_KEY:
@@ -812,23 +816,40 @@ def chat_with_gemini():
 
         # --- 이미지 데이터 처리 (이 부분은 동일) ---
         image_base64 = None
+        image_url_to_save = None
         if image_data:
+            # ✅ 디버깅용 print문 추가
+            print("✅ 이미지 데이터 수신됨, 파일 저장을 시도합니다.")
             # 데이터 URI 형식(e.g., "data:image/jpeg;base64,...")인 경우, 순수 Base64 부분만 추출
             if image_data.startswith('data:image'):
                 image_base64 = image_data.split(',')[1]
             else:
                 # 이미 순수 Base64 문자열인 경우, 그대로 사용
                 image_base64 = image_data
+            try:
+                image_bytes = base64.b64decode(image_base64)
+                filename = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}.jpg"
+                save_path = os.path.join(CHAT_IMAGE_FOLDER, filename)
+                 # ✅ 디버깅용 print문 추가
+                print(f"➡️ 이미지를 다음 경로에 저장합니다: {save_path}")
+                with open(save_path, "wb") as f:
+                    f.write(image_bytes)
+                 # ✅ 디버깅용 print문 추가
+                print("✅ 이미지 파일 저장 성공!")
+                # 프론트엔드에서 접근할 URL 경로를 생성합니다.
+                image_url_to_save = f"/uploads/chat_images/{filename}"
+            except Exception as e:
+                print(f"Error saving image: {e}")
 
         # 1. 사용자 메시지를 DB에 저장합니다.
-        save_message(conversation_id, current_user_id, 'user', user_prompt)
+        save_message(conversation_id, current_user_id, 'user', user_prompt, image_url=image_url_to_save)
         
         # 2. 방금 저장한 메시지를 포함한 '전체' 대화 기록을 불러옵니다.
         chat_history = load_history(conversation_id, current_user_id)
         
         # 3. '전체' 대화 기록을 Gemini API 형식으로 변환합니다.
         contents = []
-        for i, (sender, message) in enumerate(chat_history):
+        for i, (sender, message, image_url) in enumerate(chat_history):
             role = 'user' if sender == 'user' else 'model'
             
             # 마지막 메시지(현재 사용자 메시지)에만 이미지를 추가합니다.
@@ -901,8 +922,8 @@ def get_chat_history():
             return jsonify({
                 "conversation_id": conversation_id,
                 "messages": [
-                    {"role": role, "content": content}
-                    for role, content in messages
+                    {"role": role, "content": content, "image_url": image_url}
+                    for role, content, image_url in messages
                 ]
             })
         else:
@@ -926,6 +947,11 @@ def get_chat_history():
         print(f"대화 기록 조회 에러: {str(e)}")
         return jsonify({"error": "대화 기록을 불러오는데 실패했습니다."}), 500
 
+
+# 서버에 저장된 이미지를 프론트엔드가 불러갈 수 있도록 API 엔드포인트를 추가합니다.
+@app.route('/uploads/chat_images/<path:filename>')
+def serve_chat_image(filename):
+    return send_from_directory(CHAT_IMAGE_FOLDER, filename)
 
 if __name__ == "__main__":
     with app.app_context():
