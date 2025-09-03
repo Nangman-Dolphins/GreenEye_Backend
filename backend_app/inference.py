@@ -7,6 +7,8 @@ from PIL import Image
 import io
 import os
 import glob # 여러 fold 모델을 찾기 위해 추가
+import traceback
+import json
 
 # ==============================================================================
 # ⚙️ 1. 추론 설정 (CONFIGURATION)
@@ -88,6 +90,7 @@ class PlantDiseaseClassifier:
             return model
         except Exception as e:
             print(f"❌ TorchScript 모델 로드 실패: {path}, 에러: {e}")
+            traceback.print_exc()
             return None
 
     def _get_transform(self):
@@ -119,6 +122,8 @@ class PlantDiseaseClassifier:
             all_logits_tensor = torch.cat(all_logits, dim=0)
             return aggregate_predictions(all_logits_tensor, self.cfg.AGGREGATION_MODE, self.cfg.TOP_K_TILES)
         except Exception:
+            print("predict_probabilities exception")
+            traceback.print_exc()
             return None
 
 class EnsembleClassifier:
@@ -158,6 +163,25 @@ class ModelManager:
     def __init__(self, base_model_dir):
         self.base_dir = base_model_dir
         self.ensemble_classifiers = {} # 앙상블 모델을 캐싱
+        self._load_plant_map() # 식물 매핑 정보 로드 함수 호출
+
+    def _load_plant_map(self):
+        """plant_map.json 파일을 로드하여 한글 plant_type을 영문 식별자로 매핑합니다."""
+        self.plant_map = {}
+        map_path = os.path.join(self.base_dir, "plant_map.json")
+        try:
+            with open(map_path, 'r', encoding='utf-8') as f:
+                self.plant_map = json.load(f)
+            print("✅ 식물 종류 매핑 파일(plant_map.json) 로드 성공.")
+        except Exception as e:
+            print(f"⚠️ 경고: {map_path} 파일을 찾을 수 없습니다. plant_type을 직접 파일명으로 사용합니다. 에러: {e}")
+            # 파일이 없어도 기본 동작은 가능하도록 fallback 처리
+            self.plant_map = {"default": "default"}
+
+    def _get_filename_prefix(self, plant_type: str) -> str:
+        """plant_type에 해당하는 파일명 접두사(영문 식별자)를 반환합니다."""
+        # 매핑 정보에 있으면 해당 영문 식별자 사용, 없으면 plant_type 그대로 사용 (하위 호환성)
+        return self.plant_map.get(plant_type, plant_type)
 
     def get_classifier(self, plant_type: str):
         effective_plant_type = plant_type if plant_type else "default"
@@ -166,26 +190,33 @@ class ModelManager:
             return self.ensemble_classifiers[effective_plant_type]
 
         print(f"'{effective_plant_type}' 앙상블 모델을 로드합니다...")
+
+        # 파일명에 사용할 영문 식별자를 가져옵니다.
+        filename_prefix = self._get_filename_prefix(effective_plant_type)
+        print(f"➡️ '{effective_plant_type}' -> 파일명 접두사: '{filename_prefix}'")
         
         # 1. 클래스 레이블 로드
-        labels_path = os.path.join(self.base_dir, f"{effective_plant_type}_classes.txt")
+        labels_path = os.path.join(self.base_dir, f"{filename_prefix}_classes.txt")
         try:
             with open(labels_path, 'r', encoding='utf-8') as f:
                 class_labels = [line.strip() for line in f if line.strip()]
         except Exception:
             print(f"❌ 에러: '{labels_path}' 클래스 파일을 찾을 수 없습니다.")
+            # 특정 식물 모델 로드 실패 시 default 모델로 fallback 시도
+            if effective_plant_type != "default":
+                print(f"⚠️ 경고: '{effective_plant_type}'의 클래스 파일을 찾을 수 없습니다. 기본 모델을 사용합니다.")
+                return self.get_classifier("default")
             return None
 
-        # 2. 모든 fold 모델 파일 찾기
-        model_pattern = os.path.join(self.base_dir, f"{effective_plant_type}_model_fold*.pt")
+        # 2. 모든 fold 모델 파일 찾기 (수정)
+        model_pattern = os.path.join(self.base_dir, f"{filename_prefix}_model_fold*.pt")
         model_paths = glob.glob(model_pattern)
 
-        if not model_paths and effective_plant_type != "default":
-            print(f"⚠️ 경고: '{effective_plant_type}'의 fold 모델을 찾을 수 없습니다. 기본 모델을 사용합니다.")
-            return self.get_classifier("default")
-        
         if not model_paths:
-            print(f"❌ 에러: '{effective_plant_type}' 모델 파일을 찾을 수 없습니다.")
+            print(f"❌ 에러: '{filename_prefix}' 패턴의 모델 파일을 찾을 수 없습니다.")
+            # 역시 default 모델로 fallback
+            if effective_plant_type != "default":
+                return self.get_classifier("default")
             return None
 
         # 3. 각 fold 모델에 대한 분류기 생성
@@ -213,6 +244,5 @@ class ModelManager:
         return classifier.predict(image_bytes)
 
 # --- 모델 매니저 인스턴스 생성 ---
-base_dir = os.path.dirname(os.path.abspath(__file__))
-MODEL_FOLDER_PATH = os.path.join(base_dir, "ml_models")
+MODEL_FOLDER_PATH = "/app/backend_app/ml_models"
 model_manager = ModelManager(MODEL_FOLDER_PATH)
