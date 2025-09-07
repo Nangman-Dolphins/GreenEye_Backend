@@ -32,6 +32,7 @@ Thumbs.db
 *.pid
 *.sock
 *.log
+docker-compose.yml
 
 # --- Reports / Generated files ---
 /reports/*
