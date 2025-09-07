@@ -40,13 +40,13 @@ from reportlab.pdfbase.ttfonts import TTFont
 font_prop = None
 
 if os.path.exists(font_path):
-    # ✅ matplotlib 설정
+    # matplotlib 설정
     fm.fontManager.addfont(font_path)
     font_prop = fm.FontProperties(fname=font_path)
     plt.rcParams['font.family'] = font_prop.get_name()
     plt.rcParams['axes.unicode_minus'] = False
 
-    # ✅ reportlab 설정
+    # reportlab 설정
     pdfmetrics.registerFont(TTFont("NotoSansKR", font_path))
 
     print(f"[✔] 등록된 matplotlib 폰트 이름: {font_prop.get_name()}")
@@ -66,7 +66,7 @@ INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET") or "sensor_data"
 def _fmt_iso_utc(dt):
     return dt.astimezone(pytz.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-def generate_graph_image(rows, field, label):
+def generate_graph_image(rows, field, label, lo=None, hi=None):
     def _to_float(v):
         try:
             return float(v)
@@ -90,37 +90,52 @@ def generate_graph_image(rows, field, label):
 
     fig, ax = plt.subplots(figsize=(6, 2.5), dpi=100)
 
-    # 선만 (green)
-    ax.plot(times, values, color='green', linewidth=1.5, marker='o', markersize=2.5)
+    # ① 정상범위 음영
+    if lo is not None or hi is not None:
+        lo_line = lo if lo is not None else min(values)
+        hi_line = hi if hi is not None else max(values)
+        ax.fill_between(times, lo_line, hi_line, alpha=0.12, step="pre", zorder=0)
 
-    # ✅ x축을 우리가 명확히 지정 + 보기 좋은 날짜 포맷
+    # ② 메인 라인
+    ax.plot(times, values, linewidth=1.6, marker='o', markersize=2.5, zorder=2)
+
+    # ③ 이탈 포인트 마커
+    if lo is not None or hi is not None:
+        xs = mdates.date2num(times)
+        import numpy as np
+        vals = np.array(values, dtype=float)
+        mask_low  = (lo is not None) & (vals <  lo)
+        mask_high = (hi is not None) & (vals >  hi)
+        if mask_low.any():
+            ax.scatter(xs[mask_low], vals[mask_low], s=14, marker='o', zorder=3)
+        if mask_high.any():
+            ax.scatter(xs[mask_high], vals[mask_high], s=14, marker='^', zorder=3)
+
+    # X축 눈금/포맷
     tmin, tmax = min(times), max(times)
     if tmin == tmax:
-        # 포인트 1개일 때는 주변으로 약간의 여유
         pad = timedelta(minutes=5)
         ax.set_xlim(tmin - pad, tmax + pad)
     else:
         ax.set_xlim(tmin, tmax)
-
-    # 범위에 따라 적당한 눈금 간격 선택
-    span = (ax.get_xlim()[1] - ax.get_xlim()[0])  # days 단위 float
-    locator: mdates.DateLocator
-    if span <= 1/24 * 6:            # <= 6시간
+    span = (ax.get_xlim()[1] - ax.get_xlim()[0])  # days float
+    if span <= 1/24 * 6:
         locator = mdates.MinuteLocator(interval=10)
-    elif span <= 1:                  # <= 1일
+    elif span <= 1:
         locator = mdates.HourLocator(interval=3)
-    elif span <= 7:                  # <= 1주
+    elif span <= 7:
         locator = mdates.DayLocator(interval=1)
     else:
         locator = mdates.AutoDateLocator()
-
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
     ax.set_xlabel("시간")
-    # ax.set_ylabel(label)
-
     ax.grid(True)
+    ax.legend(
+        [lbl for lbl in ["측정값", "정상범위", "이탈 포인트"] if True],
+        loc="upper right", fontsize=8
+    )
     fig.tight_layout()
 
     buf = io.BytesIO()
@@ -130,7 +145,7 @@ def generate_graph_image(rows, field, label):
     return buf
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ 정상 범위 로딩 / 조회
+# 정상 범위 로딩 / 조회
 #   - standards 파일은 열(Column) 이름 예: plant(식물명), temperature_min/max, humidity_min/max, ...
 #   - 프로젝트 내 실제 컬럼명에 맞춰 key 매핑을 조정하세요.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,9 +413,8 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     story.append(Spacer(1, 0.5*cm))
 
     # 표준범위 로딩
-    standards_df = load_standards()  # 엑셀 -> min/max 컬럼으로 정규화  :contentReference[oaicite:10]{index=10}
+    standards_df = load_standards()
 
-    # 항목별 그래프 + 범위 비교 문장
     field_labels = [
         ("temperature","주변 온도 (°C)"),
         ("humidity","주변 습도 (%)"),
@@ -410,47 +424,38 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ("soil_ec","토양 전도도 (uS/cm)"),
     ]
     for field, label in field_labels:
-        img_buf = generate_graph_image(rows, field, label)
-        if not img_buf:
-            continue
-        story.append(Paragraph(label, styles['NotoHeading4']))
-        story.append(Image(img_buf, width=15*cm, height=5*cm))
-
-        # 범위 비교 설명
+        # 데이터 준비
         t_list, v_list = [], []
         for r in rows:
             v = r.get(field)
-            if v is None: 
+            if v is None:
                 continue
             t = r.get("_time")
             t = t if isinstance(t, datetime) else datetime.fromisoformat(str(t).replace("Z","+00:00"))
             t_list.append(t); v_list.append(_to_float(v))
 
-        lo, hi = get_range(standards_df, plant_type, field)  # 식물종에 맞춘 범위 찾기  :contentReference[oaicite:11]{index=11}
-        intervals = find_out_of_range_intervals(t_list, v_list, lo, hi)
+        # 범위
+        lo, hi = get_range(standards_df, plant_type, field)
 
+        # 그래프 (정상범위 음영 + 이탈 마커)
+        img_buf = generate_graph_image(rows, field, label, lo=lo, hi=hi)
+        if not img_buf:
+            continue
+        story.append(Paragraph(label, styles['NotoHeading4']))
+        story.append(Image(img_buf, width=15*cm, height=5*cm))
+
+        # 텍스트 요약만 (횟수)
+        intervals = find_out_of_range_intervals(t_list, v_list, lo, hi)
+        low_cnt  = sum(1 for *_, kind in intervals if kind == "low")
+        high_cnt = sum(1 for *_, kind in intervals if kind == "high")
+        total_cnt = low_cnt + high_cnt
         if lo is None and hi is None:
             story.append(Paragraph("※ 이 항목의 정상 범위를 찾을 수 없어 비교를 생략했습니다.", styles['NotoNormal']))
-        elif not intervals:
-            rng = ""
-            if lo is not None or hi is not None:
-                lo_s = f"{lo:.0f}" if lo is not None else "-"
-                hi_s = f"{hi:.0f}" if hi is not None else "-"
-                rng = f" (정상범위 {lo_s}–{hi_s})"
-            story.append(Paragraph(f"이번 주 이 항목은 대부분 정상 범위였습니다{rng}.", styles['NotoNormal']))
         else:
-            # 구간 요약
-            segs = []
-            for s, e, kind in intervals:
-                kind_ko = "상한 초과" if kind=="high" else "하한 미만"
-                segs.append(f"{s.strftime('%m/%d %H:%M')}–{e.strftime('%m/%d %H:%M')} ({kind_ko})")
             lo_s = f"{lo:.0f}" if lo is not None else "-"
             hi_s = f"{hi:.0f}" if hi is not None else "-"
-            story.append(Paragraph(
-                f"정상범위 {lo_s}–{hi_s} 기준으로 다음 구간에서 벗어났습니다: " + ", ".join(segs),
-                styles['NotoNormal']
-            ))
-
+            summary_txt = f"정상범위 {lo_s}–{hi_s} 기준, 이번 주 이탈: 낮음 {low_cnt}회 · 높음 {high_cnt}회 (총 {total_cnt}회)"
+            story.append(Paragraph(f"<font size=9 color='#64748B'>{summary_txt}</font>", styles['NotoNormal']))
         story.append(Spacer(1, 0.4*cm))
 
     # PDF 저장
