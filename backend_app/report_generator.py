@@ -11,7 +11,7 @@ import matplotlib.dates as mdates
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import cm
+from reportlab.lib.units import cm, mm
 from reportlab.lib import colors
 import io
 from email.mime.multipart import MIMEMultipart
@@ -192,10 +192,9 @@ def generate_graph_image(rows, field, label, lo=None, hi=None):
         [lbl for lbl in ["측정값", "정상범위", "이탈 포인트"] if True],
         loc="upper right", fontsize=8
     )
-    fig.tight_layout()
-
+    fig.tight_layout(pad=0.2)
     buf = io.BytesIO()
-    plt.savefig(buf, format='png')
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -389,7 +388,11 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     filename = f"greeneye_report_{_ascii_slug(device_id)}_{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.pdf"
     temp_dir = tempfile.gettempdir()
     filepath = os.path.join(temp_dir, filename)
-    doc = SimpleDocTemplate(filepath, pagesize=A4)
+    doc = SimpleDocTemplate(
+        filepath,
+        pagesize=A4,
+        leftMargin=5*mm, rightMargin=5*mm, topMargin=5*mm, bottomMargin=5*mm
+    )
     styles = getSampleStyleSheet()
     story = []
 
@@ -495,7 +498,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
         ('ALIGN',(0,0),(-1,-1),'CENTER'),
         ('FONTSIZE',(0,0),(-1,-1),10),
-        ('BOTTOMPADDING',(0,0),(-1,0),12),
+        ('BOTTOMPADDING',(0,0),(-1,0),6),
         ('GRID',(0,0),(-1,-1),1,colors.black),
     ]))
     # 테이블도 확실히 폰트 지정
