@@ -33,6 +33,7 @@ connect_influxdb()
 BASE_DIR = Path(__file__).resolve().parents[1]   # 프로젝트 루트
 font_path = BASE_DIR / "fonts" / "noto.ttf"
 STANDARDS_PATH = BASE_DIR / "reference_data" / "plant_standards_cleaned.xlsx"
+LOGO_PATH = os.getenv("GE_LOGO_PATH") or str(BASE_DIR / "assets" / "GreenEye_logo.png")
 
 # font 등록 및 설정
 from reportlab.pdfbase import pdfmetrics
@@ -395,19 +396,25 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     )
     styles = getSampleStyleSheet()
     story = []
+    if os.path.exists(LOGO_PATH):
+        img = Image(LOGO_PATH, width=5*cm, height=1.6*cm, kind="proportional")
+        img.hAlign = "LEFT"
+        story.append(img)
+        story.append(Spacer(1, 0.2*cm))
 
     from reportlab.lib.styles import ParagraphStyle
-    # 기본 스타일을 전부 BASE_FONT으로 통일 (본문/표/제목 한글 보장)
+    # 한글 폰트 적용 스타일 추가
     styles.add(ParagraphStyle(name='NotoTitle',    parent=styles['Title'],    fontName=BASE_FONT))
     styles.add(ParagraphStyle(name='NotoNormal',   parent=styles['Normal'],   fontName=BASE_FONT))
     styles.add(ParagraphStyle(name='NotoHeading4', parent=styles['Heading4'], fontName=BASE_FONT))
-    # 혹시 기본 스타일이 참조되는 곳 대비하여 byName도 일괄 교체
     for st in styles.byName.values():
         st.fontName = BASE_FONT
 
+    styles['NotoTitle'].alignment = 0  # 왼쪽 정렬
+
     # 제목/메타
     story.append(Paragraph(
-        f"<b>GreenEye 주간 식물 보고서 - {_display_text(friendly_name)} ({_display_text(device_id)})</b>",
+        f"<b>주간 식물 보고서 - {_display_text(friendly_name)} ({_display_text(device_id)})</b>",
         styles['NotoTitle']
     ))
     story.append(Paragraph(
