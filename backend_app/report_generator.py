@@ -25,6 +25,7 @@ from .database import get_db_connection, get_all_devices_any, get_all_users, get
 from pathlib import Path
 import pandas as pd
 from typing import List, Tuple, Optional
+import math
 
 load_dotenv()
 connect_influxdb()
@@ -37,21 +38,45 @@ STANDARDS_PATH = BASE_DIR / "reference_data" / "plant_standards_cleaned.xlsx"
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+SYSTEM_KR_FONT = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+KR_FONT_NAME   = "KR"
+
+def _setup_fonts_unified():
+    """
+    1) 내부 noto.ttf 있으면 최우선 사용
+    2) 없으면 시스템 NanumGothic 사용
+    3) 실패 시 Helvetica (경고만)
+    """
+    candidate = None
+    if os.path.exists(font_path):
+        candidate = str(font_path)
+    elif os.path.exists(SYSTEM_KR_FONT):
+        candidate = SYSTEM_KR_FONT
+
+    base_font = "Helvetica"
+    try:
+        if candidate:
+            # Matplotlib
+            fm.fontManager.addfont(candidate)
+            fp = fm.FontProperties(fname=candidate)
+            plt.rcParams["font.family"]     = fp.get_name()
+            plt.rcParams["axes.unicode_minus"] = False
+            plt.rcParams["pdf.fonttype"]    = 42
+            plt.rcParams["ps.fonttype"]     = 42
+            # ReportLab
+            pdfmetrics.registerFont(TTFont(KR_FONT_NAME, candidate))
+            base_font = KR_FONT_NAME
+            print(f"[✔] PDF/Matplotlib font set to: {fp.get_name()} ({candidate})")
+        else:
+            print("[ℹ] No KR font found. Falling back to Helvetica (may show ????).")
+    except Exception as e:
+        print(f"[WARN] font setup failed: {e} (fallback Helvetica)")
+    return base_font
+
+# 전역 기본 폰트명
+BASE_FONT = _setup_fonts_unified()
+
 font_prop = None
-
-if os.path.exists(font_path):
-    # matplotlib 설정
-    fm.fontManager.addfont(font_path)
-    font_prop = fm.FontProperties(fname=font_path)
-    plt.rcParams['font.family'] = font_prop.get_name()
-    plt.rcParams['axes.unicode_minus'] = False
-
-    # reportlab 설정
-    pdfmetrics.registerFont(TTFont("NotoSansKR", font_path))
-
-    print(f"[✔] 등록된 matplotlib 폰트 이름: {font_prop.get_name()}")
-else:
-    print("[ℹ] NotoSansKR 폰트 파일이 없어 기본 폰트로 진행합니다.")
 
 #테스트로 window 5분
 REPORT_AGG_WINDOW = os.getenv("REPORT_AGG_WINDOW", "1h")
@@ -62,6 +87,37 @@ EMAIL_USERNAME = os.getenv("EMAIL_USERNAME")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET") or "sensor_data"
 
+def _looks_mojibake(s: Optional[str]) -> bool:
+    """
+    None/공백이거나, 물음표가 포함된 경우(특히 '??' 이상)를 오염으로 간주.
+    괄호 안 영문(예: '(Monstera)') 때문에 정상으로 오판하지 않도록 괄호 내용은 무시.
+    """
+    if not s:
+        return True
+    t = str(s).strip()
+    if not t:
+        return True
+    # 빠른 판정: '??'가 들어가면 오염으로 본다
+    if "??" in t:
+        return True
+    # 괄호 안 내용 제거 후 다시 검사
+    import re
+    core = re.sub(r"\([^)]*\)", "", t)
+    q = core.count('?')
+    alnum = sum(ch.isalnum() for ch in core)
+    return q >= 2 and alnum == 0
+
+def _display_text(s: Optional[str]) -> str:
+    """표시용 텍스트: 절대 ASCII 강제 변환 금지(원문 유지)."""
+    return "" if s is None else str(s)
+
+def _ascii_slug(s: Optional[str]) -> str:
+    """파일명 안전화 전용(표시문구와 절대 섞지 않음)."""
+    import re, unicodedata
+    s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+    return s or "report"
 
 def _fmt_iso_utc(dt):
     return dt.astimezone(pytz.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -176,10 +232,16 @@ def load_standards() -> Optional[pd.DataFrame]:
       토양전도도(uS/cm) → soil_ec_min/max
     """
     try:
-        df = pd.read_excel(STANDARDS_PATH)
+        # [ADD] openpyxl 엔진 우선 시도 (컨테이너에 openpyxl 설치 시 안정)
+        df = pd.read_excel(STANDARDS_PATH, engine="openpyxl")
     except Exception as e:
         print(f"[WARN] could not load standards: {e}")
-        return None
+        # [ADD] 엔진 미설치 등으로 실패하면 기본 엔진 한 번 더 시도
+        try:
+            df = pd.read_excel(STANDARDS_PATH)
+        except Exception as e2:
+            print(f"[WARN] fallback read_excel also failed: {e2} (path={STANDARDS_PATH})")
+            return None
 
     # 1) 컬럼명 공백 제거
     df.columns = [str(c).strip() for c in df.columns]
@@ -227,41 +289,44 @@ def load_standards() -> Optional[pd.DataFrame]:
 
     return df
 
-def get_range(standards: Optional[pd.DataFrame], plant_type: Optional[str], field: str) -> Tuple[Optional[float], Optional[float]]:
-    """
-    field: 'temperature' | 'humidity' | 'light_lux' | 'soil_temp' | 'soil_moisture' | 'soil_ec'
-    standards 내 컬럼명 규칙 예: temperature_min, temperature_max ...
-    """
+# 품종명 정규화 + 영문명 fallback을 포함한 견고한 범위 매칭 함수
+import re
+def _norm_name(s: str) -> str:
+    s = str(s or "").strip().lower()
+    s = s.replace("（","(").replace("）",")")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _eng_in_paren(s: str) -> str:
+    m = re.search(r"\(([^)]+)\)", s or "")
+    return (m.group(1).strip().lower() if m else "")
+
+def get_range_robust(standards: Optional[pd.DataFrame], plant_type: Optional[str], field: str):
     if standards is None or not plant_type:
         return None, None
-    df = standards
-    # 동의어/부분일치 허용 (예: 'rhododendron' ↔ '진달래/철쭉' 표기)
-    aliases = {
-        "rhododendron": ["rhododendron", "진달래", "철쭉", "azalea"],
-        "monstera": ["monstera", "몬스테라"],
-        "sansevieria": ["sansevieria", "산세베리아", "스투키", "dracaena trifasciata"],
-        "ficus elastica": ["ficus elastica", "고무나무"],
-    }
-    key = str(plant_type).strip().lower()
-    keys = aliases.get(key, [key])
-    mask = df["plant_name_norm"].apply(lambda s: any(k in s for k in keys))
-    row = df.loc[mask]
+    if "plant_name_norm" not in standards.columns:
+        return None, None
+    key = _norm_name(plant_type)
+    key_eng = _eng_in_paren(key)
+    # 1) 부분일치(전체 표기)
+    row = standards.loc[standards["plant_name_norm"].str.contains(re.escape(key), na=False)]
+    # 2) 영문명만으로 fallback
+    if row.empty and key_eng:
+        row = standards.loc[standards["plant_name_norm"].str.contains(re.escape(key_eng), na=False)]
+    # 3) 완전 일치 최종 시도
     if row.empty:
-        # 완전일치 시도 (마지막 보루)
-        row = df.loc[df["plant_name_norm"] == key]
+        row = standards.loc[standards["plant_name_norm"] == key]
         if row.empty:
             return None, None
-    lo_col = f"{field}_min"
-    hi_col = f"{field}_max"
-    lo = row.iloc[0].get(lo_col, None)
-    hi = row.iloc[0].get(hi_col, None)
-    try:
-        lo = float(lo) if lo is not None else None
+    lo_col = f"{field}_min"; hi_col = f"{field}_max"
+    lo = row.iloc[0].get(lo_col, None); hi = row.iloc[0].get(hi_col, None)
+    try: lo = float(lo) if lo is not None else None
     except: lo = None
-    try:
-        hi = float(hi) if hi is not None else None
+    try: hi = float(hi) if hi is not None else None
     except: hi = None
     return lo, hi
+
+get_range = get_range_robust
 
 def _to_float(v):
     try: return float(v)
@@ -305,7 +370,23 @@ def _resolve_room(device_id: str, room: str | None) -> str | None:
 
 def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, plant_type=None, room=None):
     room = _resolve_room(device_id, room)
-    filename = f"greeneye_report_{device_id}_{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.pdf"
+    
+    plant_disp = plant_type
+    room_disp  = room
+    try:
+        if _looks_mojibake(plant_disp) or not plant_disp:
+            d = get_device_by_device_id_any(device_id)
+            if d and d.get("plant_type"):
+                plant_disp = d["plant_type"]
+        if _looks_mojibake(room_disp) or not room_disp:
+            if 'd' not in locals():
+                d = get_device_by_device_id_any(device_id)
+            if d and d.get("room"):
+                room_disp = d["room"]
+    except Exception:
+        pass
+    
+    filename = f"greeneye_report_{_ascii_slug(device_id)}_{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.pdf"
     temp_dir = tempfile.gettempdir()
     filepath = os.path.join(temp_dir, filename)
     doc = SimpleDocTemplate(filepath, pagesize=A4)
@@ -313,17 +394,26 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     story = []
 
     from reportlab.lib.styles import ParagraphStyle
-    base_font = 'NotoSansKR' if os.path.exists(font_path) else 'Helvetica'
-    styles.add(ParagraphStyle(name='NotoTitle',    parent=styles['Title'],    fontName=base_font))
-    styles.add(ParagraphStyle(name='NotoNormal',   parent=styles['Normal'],   fontName=base_font))
-    styles.add(ParagraphStyle(name='NotoHeading4', parent=styles['Heading4'], fontName=base_font))
+    # 기본 스타일을 전부 BASE_FONT으로 통일 (본문/표/제목 한글 보장)
+    styles.add(ParagraphStyle(name='NotoTitle',    parent=styles['Title'],    fontName=BASE_FONT))
+    styles.add(ParagraphStyle(name='NotoNormal',   parent=styles['Normal'],   fontName=BASE_FONT))
+    styles.add(ParagraphStyle(name='NotoHeading4', parent=styles['Heading4'], fontName=BASE_FONT))
+    # 혹시 기본 스타일이 참조되는 곳 대비하여 byName도 일괄 교체
+    for st in styles.byName.values():
+        st.fontName = BASE_FONT
 
     # 제목/메타
-    story.append(Paragraph(f"<b>GreenEye 주간 식물 보고서 - {friendly_name} ({device_id})</b>", styles['NotoTitle']))
-    story.append(Paragraph(f"기간: {start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}", styles['NotoNormal']))
-    if plant_type:
-        story.append(Paragraph(f"식물 종류: {plant_type}", styles['NotoNormal']))
-    story.append(Paragraph(f"위치: {room or '(미설정)'}", styles['NotoNormal']))
+    story.append(Paragraph(
+        f"<b>GreenEye 주간 식물 보고서 - {_display_text(friendly_name)} ({_display_text(device_id)})</b>",
+        styles['NotoTitle']
+    ))
+    story.append(Paragraph(
+        f"기간: {start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}",
+        styles['NotoNormal']
+    ))
+    if plant_disp:
+        story.append(Paragraph(f"식물 종류: {_display_text(plant_disp)}", styles['NotoNormal']))
+    story.append(Paragraph(f"위치: {_display_text(room_disp) or '(미설정)'}", styles['NotoNormal']))
     story.append(Spacer(1, 0.3*cm))
 
     # 배터리 상태 포맷터
@@ -404,17 +494,27 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ('BACKGROUND',(0,0),(-1,0),colors.grey),
         ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
         ('ALIGN',(0,0),(-1,-1),'CENTER'),
-        ('FONTNAME',(0,0),(-1,-1),base_font),
         ('FONTSIZE',(0,0),(-1,-1),10),
         ('BOTTOMPADDING',(0,0),(-1,0),12),
         ('GRID',(0,0),(-1,-1),1,colors.black),
+    ]))
+    # 테이블도 확실히 폰트 지정
+    avg_table.setStyle(TableStyle([
+        ('FONTNAME',(0,0),(-1,-1),BASE_FONT),
     ]))
     story.append(avg_table)
     story.append(Spacer(1, 0.5*cm))
 
     # 표준범위 로딩
     standards_df = load_standards()
-
+    # 로딩 실패 시 한 번 더 시도(엔진 문제 등)
+    if standards_df is None:
+        try:
+            standards_df = pd.read_excel(STANDARDS_PATH, engine="openpyxl")
+        except Exception as e:
+            print(f"[WARN] standards second try failed: {e}")
+    
+    
     field_labels = [
         ("temperature","주변 온도 (°C)"),
         ("humidity","주변 습도 (%)"),
@@ -445,9 +545,9 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         story.append(Image(img_buf, width=15*cm, height=5*cm))
 
         # 텍스트 요약만 (횟수)
-        intervals = find_out_of_range_intervals(t_list, v_list, lo, hi)
-        low_cnt  = sum(1 for *_, kind in intervals if kind == "low")
-        high_cnt = sum(1 for *_, kind in intervals if kind == "high")
+        vals = [float(x) for x in v_list if x is not None and not (isinstance(x, float) and math.isnan(x))]
+        low_cnt  = sum(1 for x in vals if lo is not None and x <  lo)
+        high_cnt = sum(1 for x in vals if hi is not None and x >  hi)
         total_cnt = low_cnt + high_cnt
         if lo is None and hi is None:
             story.append(Paragraph("※ 이 항목의 정상 범위를 찾을 수 없어 비교를 생략했습니다.", styles['NotoNormal']))
@@ -485,10 +585,10 @@ def send_email_with_pdf(to_email, subject, body_text, pdf_path):
             server.ehlo()
             server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
             server.send_message(msg)  # 헤더/인코딩 자동 처리
-        print(f"✅ PDF 보고서 전송 성공: {to_email}")
+        print(f"PDF 보고서 전송 성공: {to_email}")
         return True
     except Exception as e:
-        print(f"❌ 이메일 전송 오류: {e}")
+        print(f"이메일 전송 오류: {e}")
         return False
 
 def send_all_reports():
