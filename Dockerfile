@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # 필요한 CLI (sqlite3, curl 등) 설치
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    sqlite3 ca-certificates curl tzdata \
+    sqlite3 ca-certificates curl tzdata fontconfig fonts-nanum \
   && rm -rf /var/lib/apt/lists/*
 
 # 컨테이너 내에서 작업할 디렉토리를 /app으로 설정
@@ -17,10 +17,11 @@ COPY requirements.txt .
 # 폰트 파일을 컨테이너 안으로 복사
 COPY fonts /app/fonts
 
+# openpyxl 설치 (pandas가 엑셀 읽기 위함)
+RUN pip install --no-cache-dir openpyxl
+
 # 복사한 requirements.txt를 사용해 파이썬 패키지들을 설치
 RUN pip install --no-cache-dir -r requirements.txt
-
-
 
 # 로컬의 모든 프로젝트 파일을 컨테이너의 /app 디렉토리로 복사
 COPY . .
