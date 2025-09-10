@@ -539,6 +539,10 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ('RIGHTPADDING',  (0,0), (-1,-1), 0),
         ('TOPPADDING',    (0,0), (-1,-1), 0),
         ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+        ('LINEBELOW',     (0,0), (-1,0), 0.8, colors.HexColor("#E5E7EB")),
+        # ▶ 우측 셀만 바닥 정렬 & 패딩 살짝 축소해 룰과 더 가까이
+        ('VALIGN',        (1,0), (1,0), 'BOTTOM'),
+        ('BOTTOMPADDING', (1,0), (1,0), 1),
     ]))
     story.append(header)
     story.append(Spacer(1, 0.3*cm))
