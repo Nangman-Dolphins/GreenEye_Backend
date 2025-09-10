@@ -8,10 +8,13 @@ import tempfile
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import matplotlib.dates as mdates
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm, mm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors
 import io
 from email.mime.multipart import MIMEMultipart
@@ -396,41 +399,31 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     )
     styles = getSampleStyleSheet()
     story = []
-    if os.path.exists(LOGO_PATH):
-        img = Image(LOGO_PATH, width=5*cm, height=1.6*cm, kind="proportional")
-        img.hAlign = "LEFT"
-        story.append(img)
-        story.append(Spacer(1, 0.2*cm))
 
-    from reportlab.lib.styles import ParagraphStyle
-    # 한글 폰트 적용 스타일 추가
+    # 스타일 정의/보정 (먼저 추가 → 이후 정렬 변경)
     styles.add(ParagraphStyle(name='NotoTitle',    parent=styles['Title'],    fontName=BASE_FONT))
     styles.add(ParagraphStyle(name='NotoNormal',   parent=styles['Normal'],   fontName=BASE_FONT))
     styles.add(ParagraphStyle(name='NotoHeading4', parent=styles['Heading4'], fontName=BASE_FONT))
     for st in styles.byName.values():
         st.fontName = BASE_FONT
+    styles['NotoTitle'].alignment = 0  # 제목 왼쪽 정렬
 
-    styles['NotoTitle'].alignment = 0  # 왼쪽 정렬
-
-    # 제목/메타
-    story.append(Paragraph(
-        f"<b>주간 식물 보고서 - {_display_text(friendly_name)} ({_display_text(device_id)})</b>",
-        styles['NotoTitle']
+    # 우측 메타 스타일(작은 글자, 옅은 색, 오른쪽 정렬)
+    styles.add(ParagraphStyle(
+        name='MetaRight',
+        parent=styles['NotoNormal'],
+        alignment=2,  # RIGHT
+        fontSize=8.5,
+        textColor=colors.HexColor("#64748B"),
+        leading=11,
+        wordWrap='CJK'
     ))
-    story.append(Paragraph(
-        f"기간: {start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}",
-        styles['NotoNormal']
-    ))
-    if plant_disp:
-        story.append(Paragraph(f"식물 종류: {_display_text(plant_disp)}", styles['NotoNormal']))
-    story.append(Paragraph(f"위치: {_display_text(room_disp) or '(미설정)'}", styles['NotoNormal']))
-    story.append(Spacer(1, 0.3*cm))
 
     # 배터리 상태 포맷터
     def battery_status_string(level):
         if level is None: return "데이터 없음"
-        if level >= 65:  return f"양호 ({level:.2f}%)"
-        if level >= 40:  return f"낮음 ({level:.2f}%)"
+        if level >= 45:  return f"양호 ({level:.2f}%)"
+        if level >= 30:  return f"낮음 ({level:.2f}%)"
         if level >= 15:  return f"매우 낮음 ({level:.2f}%)"
         return f"위험 ({level:.2f}%)"
 
@@ -447,17 +440,13 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
     |> keep(columns: ["_time","device_id","temperature","humidity","light_lux","soil_moisture","soil_temp","soil_ec","battery"])
     """
-    rows = query_influxdb_data(query)  # 성공적으로 데이터 가져옴/없음 처리 포함  :contentReference[oaicite:9]{index=9}
-    if not rows:
-        story.append(Paragraph("이 기간 동안의 센서 데이터를 가져올 수 없거나, 데이터가 없습니다.", styles['NotoNormal']))
-        doc.build(story)
-        return filepath
+    rows = query_influxdb_data(query)
 
     # 숫자/시간 정규화
     def _to_float(v):
         try: return float(v)
         except: return None
-    for r in rows:
+    for r in (rows or []):
         for k in ["temperature","humidity","light_lux","soil_moisture","soil_temp","soil_ec","battery"]:
             if r.get(k) is not None:
                 r[k] = _to_float(r[k])
@@ -469,15 +458,86 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
 
     # 최신 배터리/최근값
     def last_value(key):
-        for r in sorted(rows, key=lambda x: x.get("_time") or datetime.min, reverse=True):
+        for r in sorted((rows or []), key=lambda x: x.get("_time") or datetime.min, reverse=True):
             v = r.get(key)
             if v is not None: return v
         return None
     latest_battery = last_value("battery")
 
-    # 배터리 상태
-    story.append(Paragraph(f"배터리 상태: {battery_status_string(latest_battery)}", styles['NotoNormal']))
-    story.append(Spacer(1, 0.4*cm))
+    # ── 헤더: 좌(제목) + 우(메타 한 줄) ──────────────────────────────
+    title_p = Paragraph(
+        f"<b>주간 식물 보고서 - {_display_text(friendly_name)} ({_display_text(device_id)})</b>",
+        styles['NotoTitle']
+    )
+    # 식물 표시에서 괄호 앞 줄바꿈 방지 NBSP 처리
+    _plant_label = None
+    if plant_disp:
+        _plant_label = _display_text(plant_disp).replace(" (", "&nbsp;(")
+    meta_parts = [
+        f"기간: {start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}",
+        f"식물: {_plant_label}" if _plant_label else None,
+        f"위치: {_display_text(room_disp) or '(미설정)'}",
+        f"배터리: {battery_status_string(latest_battery).replace('(%.2f' , '(%').replace('.00%', '%') if isinstance(latest_battery,(int,float)) else battery_status_string(latest_battery)}",
+    ]
+    meta_txt = "  ·  ".join([m for m in meta_parts if m])
+    meta_p = Paragraph(meta_txt, styles['MetaRight'])
+
+    # 좌측 셀: 로고(폭/높이 모두 지정해 안전하게) → 제목을 한 덩어리로
+    _logo_img = None
+    try:
+        print(f"[DEBUG] LOGO_PATH={LOGO_PATH} | cwd={os.getcwd()}")
+        with open(LOGO_PATH, "rb") as _fh:
+            _bytes = _fh.read()
+        _bio = io.BytesIO(_bytes)
+        # 원본 픽셀 크기 → 비율 계산
+        ir = ImageReader(io.BytesIO(_bytes))
+        iw_px, ih_px = ir.getSize()             # 픽셀
+        max_w_pt = 4.2*cm                       # 원하는 폭 (pt)
+        scale = max_w_pt / float(iw_px)         # 비율
+        w_pt = max_w_pt
+        h_pt = float(ih_px) * scale
+        _bio.seek(0)
+        _logo_img = Image(_bio, width=w_pt, height=h_pt)  # kind 생략(직접 지정)
+        _logo_img.hAlign = "LEFT"
+    except Exception as _e:
+        print(f"[WARN] Logo load failed: {type(_e).__name__}: {_e} (path={LOGO_PATH})")
+
+    # 좌측 셀 구성: 로고가 있으면 2행짜리 중첩 테이블(로고 / 제목), 없으면 제목만
+    if _logo_img:
+        left_nested = Table([[ _logo_img ],
+                             [ title_p ]],
+                            colWidths=[12.0*cm])  # 좌측 영역 폭(임의)
+        left_nested.setStyle(TableStyle([
+            ('ALIGN',        (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING',   (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING',(0,0), (-1,-1), 0),
+        ]))
+        left_cell = left_nested
+    else:
+        left_cell = title_p
+
+    # 같은 행에 좌:로고+제목, 우:메타
+    header = Table([[left_cell, meta_p]], colWidths=[11.8*cm, 8.2*cm], hAlign='LEFT')
+    header.setStyle(TableStyle([
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('ALIGN',         (0,0), (0,0),   'LEFT'),
+        ('ALIGN',         (1,0), (1,0),   'RIGHT'),
+        ('LEFTPADDING',   (0,0), (-1,-1), 0),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 0),
+        ('TOPPADDING',    (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+    ]))
+    story.append(header)
+    story.append(Spacer(1, 0.3*cm))
+
+    # 데이터가 없을 때도 헤더는 보이도록, 여기서 처리
+    if not rows:
+        story.append(Paragraph("이 기간 동안의 센서 데이터를 가져올 수 없거나, 데이터가 없습니다.", styles['NotoNormal']))
+        doc.build(story)
+        return filepath
 
     # 평균/최근값 표
     story.append(Paragraph("센서 요약 (평균값 & 최근값)", styles['NotoHeading4']))
