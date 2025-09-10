@@ -473,14 +473,24 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     _plant_label = None
     if plant_disp:
         _plant_label = _display_text(plant_disp).replace(" (", "&nbsp;(")
-    meta_parts = [
+    # ── 메타(우측) 4줄로: 1열×N행 중첩 테이블 ─────────────────────────────
+    meta_lines = [
         f"기간: {start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}",
-        f"식물: {_plant_label}" if _plant_label else None,
+        (f"식물: {_plant_label}" if _plant_label else None),
         f"위치: {_display_text(room_disp) or '(미설정)'}",
-        f"배터리: {battery_status_string(latest_battery).replace('(%.2f' , '(%').replace('.00%', '%') if isinstance(latest_battery,(int,float)) else battery_status_string(latest_battery)}",
+        (f"배터리: {battery_status_string(latest_battery).replace('(%.2f' , '(%').replace('.00%', '%')}"
+         if isinstance(latest_battery, (int, float)) else f"배터리: {battery_status_string(latest_battery)}"),
     ]
-    meta_txt = "  ·  ".join([m for m in meta_parts if m])
-    meta_p = Paragraph(meta_txt, styles['MetaRight'])
+    meta_rows = [[Paragraph(line, styles['MetaRight'])] for line in meta_lines if line]
+    right_nested = Table(meta_rows, colWidths=[8.2*cm], hAlign='RIGHT')
+    right_nested.setStyle(TableStyle([
+        ('ALIGN',         (0,0), (-1,-1), 'RIGHT'),
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING',   (0,0), (-1,-1), 0),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 0),
+        ('TOPPADDING',    (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+    ]))
 
     # 좌측 셀: 로고(폭/높이 모두 지정해 안전하게) → 제목을 한 덩어리로
     _logo_img = None
@@ -520,7 +530,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         left_cell = title_p
 
     # 같은 행에 좌:로고+제목, 우:메타
-    header = Table([[left_cell, meta_p]], colWidths=[11.8*cm, 8.2*cm], hAlign='LEFT')
+    header = Table([[left_cell, right_nested]], colWidths=[11.8*cm, 8.2*cm], hAlign='LEFT')
     header.setStyle(TableStyle([
         ('VALIGN',        (0,0), (-1,-1), 'TOP'),
         ('ALIGN',         (0,0), (0,0),   'LEFT'),
