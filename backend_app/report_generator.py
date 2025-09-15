@@ -599,48 +599,86 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
             print(f"[WARN] standards second try failed: {e}")
     
     
-    field_labels = [
+    # ── 2열 레이아웃: 좌(주변 온도/습도/조도), 우(토양 온도/수분/전도도) ──
+    left_fields  = [
         ("temperature","주변 온도 (°C)"),
         ("humidity","주변 습도 (%)"),
         ("light_lux","조도 (lux)"),
+    ]
+    right_fields = [
         ("soil_temp","토양 온도 (°C)"),
         ("soil_moisture","토양 수분 (%)"),
         ("soil_ec","토양 전도도 (uS/cm)"),
     ]
-    for field, label in field_labels:
-        # 데이터 준비
-        t_list, v_list = [], []
+
+    col_w = 9.6*cm          # 각 칸 너비
+    img_h = 4.3*cm          # 그래프 높이 (한 페이지 3개씩)
+
+    def build_metric_block(field, label):
+        # 값 목록만 추출 (요약 계산용)
+        v_list = []
         for r in rows:
             v = r.get(field)
-            if v is None:
-                continue
-            t = r.get("_time")
-            t = t if isinstance(t, datetime) else datetime.fromisoformat(str(t).replace("Z","+00:00"))
-            t_list.append(t); v_list.append(_to_float(v))
-
-        # 범위
+            if v is not None:
+                v_list.append(_to_float(v))
+        # 정상 범위
         lo, hi = get_range(standards_df, plant_type, field)
-
-        # 그래프 (정상범위 음영 + 이탈 마커)
+        # 그래프 이미지
         img_buf = generate_graph_image(rows, field, label, lo=lo, hi=hi)
-        if not img_buf:
-            continue
-        story.append(Paragraph(label, styles['NotoHeading4']))
-        story.append(Image(img_buf, width=15*cm, height=5*cm))
-
-        # 텍스트 요약만 (횟수)
-        vals = [float(x) for x in v_list if x is not None and not (isinstance(x, float) and math.isnan(x))]
-        low_cnt  = sum(1 for x in vals if lo is not None and x <  lo)
-        high_cnt = sum(1 for x in vals if hi is not None and x >  hi)
-        total_cnt = low_cnt + high_cnt
+        # 구성 파트(1열 N행)
+        parts = [[Paragraph(label, styles['NotoHeading4'])]]
+        if img_buf:
+            parts.append([Image(img_buf, width=col_w, height=img_h)])
+        # 요약 텍스트
+        import math as _math
+        vals = [float(x) for x in v_list if x is not None and not (_math.isnan(x) if isinstance(x, float) else False)]
         if lo is None and hi is None:
-            story.append(Paragraph("※ 이 항목의 정상 범위를 찾을 수 없어 비교를 생략했습니다.", styles['NotoNormal']))
+            parts.append([Paragraph("※ 이 항목의 정상 범위를 찾을 수 없어 비교를 생략했습니다.", styles['NotoNormal'])])
         else:
             lo_s = f"{lo:.0f}" if lo is not None else "-"
             hi_s = f"{hi:.0f}" if hi is not None else "-"
+            low_cnt  = sum(1 for x in vals if lo is not None and x <  lo)
+            high_cnt = sum(1 for x in vals if hi is not None and x >  hi)
+            total_cnt = low_cnt + high_cnt
             summary_txt = f"정상범위 {lo_s}–{hi_s} 기준, 이번 주 이탈: 낮음 {low_cnt}회 · 높음 {high_cnt}회 (총 {total_cnt}회)"
-            story.append(Paragraph(f"<font size=9 color='#64748B'>{summary_txt}</font>", styles['NotoNormal']))
-        story.append(Spacer(1, 0.4*cm))
+            summary_html = f"<font size=9 color='#64748B'>{summary_txt}</font>"
+            parts.append([Paragraph(summary_html, styles['NotoNormal'])])
+        # 칸 안 여백
+        parts.append([Spacer(1, 0.25*cm)])
+        t = Table(parts, colWidths=[col_w])
+        t.setStyle(TableStyle([
+            ('ALIGN',        (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING',   (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING',(0,0), (-1,-1), 0),
+        ]))
+        return t
+
+    # 좌/우 컬럼 구성
+    left_column  = Table([[build_metric_block(f,l)] for f,l in left_fields],  colWidths=[col_w])
+    right_column = Table([[build_metric_block(f,l)] for f,l in right_fields], colWidths=[col_w])
+    for col in (left_column, right_column):
+        col.setStyle(TableStyle([
+            ('ALIGN',        (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING',   (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING',(0,0), (-1,-1), 0),
+        ]))
+
+    # 두 컬럼 사이 가터(여백) 0.8cm 확보를 위해 빈 열을 끼운 3열 테이블 사용
+    grid = Table([[left_column, '', right_column]], colWidths=[col_w, 0.8*cm, col_w], hAlign='LEFT')
+    grid.setStyle(TableStyle([
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING',   (0,0), (-1,-1), 0),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 0),
+        ('TOPPADDING',    (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+    ]))
+    story.append(grid)
 
     # PDF 저장
     doc.build(story)
