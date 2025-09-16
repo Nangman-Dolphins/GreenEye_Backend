@@ -12,7 +12,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm, mm
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image, Spacer
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepInFrame)
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors
@@ -555,7 +555,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
 
     # 평균/최근값 표
     story.append(Paragraph("센서 요약 (평균값 & 최근값)", styles['NotoHeading4']))
-    def fmt(v): return "N/A" if v is None else f"{float(v):.2f}"
+    def fmt(v): return "N/A" if v is None else f"{float(v):.1f}"
     last = {
         "temperature":   last_value("temperature"),
         "humidity":      last_value("humidity"),
@@ -564,29 +564,147 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         "soil_moisture": last_value("soil_moisture"),
         "soil_ec":       last_value("soil_ec"),
     }
-    table_data = [
-        ["항목","평균값","최근값"],
-        ["주변 온도 (°C)",     f"{avg(pick('temperature')):.2f}",   fmt(last["temperature"])],
-        ["주변 습도 (%)",       f"{avg(pick('humidity')):.2f}",      fmt(last["humidity"])],
-        ["주변 조도 (lux)",     f"{avg(pick('light_lux')):.2f}",     fmt(last["light_lux"])],
-        ["토양 온도 (°C)",      f"{avg(pick('soil_temp')):.2f}",     fmt(last["soil_temp"])],
-        ["토양 수분 (%)",       f"{avg(pick('soil_moisture')):.2f}", fmt(last["soil_moisture"])],
-        ["토양 전도도 (uS/cm)", f"{avg(pick('soil_ec')):.2f}",       fmt(last["soil_ec"])],
+
+    # ── 카드 레이아웃 helpers ──────────────────────────────────────
+    def _avg_of(key): 
+        vals = [v for v in pick(key) if v is not None]
+        return (sum(vals)/len(vals)) if vals else None
+    def _range_text(lo, hi):
+        lo_s = "-" if lo is None else (f"{lo:.0f}")
+        hi_s = "-" if hi is None else (f"{hi:.0f}")
+        return f"정상범위: {lo_s}–{hi_s}"
+    def _chip(text, warn=False):
+        # 칩(최근값) 배경/테두리
+        bg = colors.HexColor("#F1F5F9") if not warn else colors.HexColor("#FDECEC")
+        fg = colors.HexColor("#0F172A") if not warn else colors.HexColor("#B91C1C")
+        t = Table([[Paragraph(text, ParagraphStyle(name="chip", parent=styles['NotoNormal'],
+                                                   fontSize=10, textColor=fg))]],
+                  colWidths=[None])
+        t.setStyle(TableStyle([
+            ('LEFTPADDING', (0,0), (-1,-1), 4),
+            ('RIGHTPADDING',(0,0), (-1,-1), 4),
+            ('TOPPADDING',  (0,0), (-1,-1), 2),
+            ('BOTTOMPADDING',(0,0),(-1,-1), 2),
+            ('BACKGROUND',  (0,0), (-1,-1), bg),
+            ('BOX',         (0,0), (-1,-1), 0.3, colors.HexColor("#E2E8F0")),
+            ('ROUNDRECT',   (0,0), (-1,-1), 2, 2),
+            ('ALIGN',       (0,0), (-1,-1), 'LEFT'),
+        ]))
+        return t
+    
+    # 숫자 + 단위를 한 줄로(줄바꿈 금지) 묶어주는 헬퍼
+    def _nobr_num_unit(num_str: str, unit: str) -> str:
+        # uS/cm → µS/cm로 보정(폰트 지원 + 가독성)
+        unit_disp = unit.replace("uS/cm", "µS/cm")
+        # 숫자와 단위 사이를 non-breaking space로, 전체를 <nobr>로 감싼다
+        return f"<nobr>{num_str}&nbsp;{unit_disp}</nobr>"
+    
+    styles.add(ParagraphStyle(
+        name='CardTitle', parent=styles['NotoNormal'],
+        fontSize=10.5, leading=13, spaceAfter=1
+    ))
+    styles.add(ParagraphStyle(
+        name='CardMeta', parent=styles['NotoNormal'],
+        fontSize=9.5, leading=12
+    ))
+    styles.add(ParagraphStyle(
+        name='CardRange', parent=styles['NotoNormal'],
+        fontSize=8.5, leading=11, textColor=colors.HexColor("#64748B")
+    ))
+    
+    # 표준범위(카드 경고판단에 사용) - 아래에서 standards_df 재사용됨
+    standards_df = load_standards() if 'standards_df' not in locals() else standards_df
+
+    # 카드 데이터 정의(순서 유지)
+    CARD_ITEMS = [
+        ("온도",   "temperature",   "°C",     "temperature"),
+        ("습도",   "humidity",      "%",      "humidity"),
+        ("조도",   "light_lux",     "lux",    "light_lux"),
+        ("토양 온도",   "soil_temp",     "°C",     "soil_temp"),
+        ("토양 수분",   "soil_moisture", "%",      "soil_moisture"),
+        ("토양 전도도", "soil_ec",       "uS/cm",  "soil_ec"),
     ]
-    avg_table = Table(table_data, colWidths=[6*cm,4*cm,4*cm])
-    avg_table.setStyle(TableStyle([
-        ('BACKGROUND',(0,0),(-1,0),colors.grey),
-        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
-        ('ALIGN',(0,0),(-1,-1),'CENTER'),
-        ('FONTSIZE',(0,0),(-1,-1),10),
-        ('BOTTOMPADDING',(0,0),(-1,0),6),
-        ('GRID',(0,0),(-1,-1),1,colors.black),
+
+    # 한 줄에 6개: 총 유효폭 20cm, 가터 0.2cm × 5 → 카드 폭
+    gutter = 0.15*cm
+    card_w = (20*cm - gutter*5) / 6.0
+    card_h = 3.8*cm
+
+    card_cells = []
+    for label, key, unit, std_key in CARD_ITEMS:
+        a = _avg_of(key)
+        l = last.get(key)
+        lo, hi = get_range(standards_df, plant_type, std_key)
+        warn = False
+        if isinstance(l, (int, float)):
+            if (lo is not None and l < lo) or (hi is not None and l > hi):
+                warn = True
+        # 카드 내부(세로 스택)
+        title = Paragraph(f"<b>{label}</b>", styles['CardTitle'])
+        # 라벨과 값을 확실히 줄바꿈: '평균' 1줄 + '숫자 단위' 1줄
+        avg_p = Paragraph(
+            f"평균<br/><b>{_nobr_num_unit(fmt(a), unit)}</b>",
+            styles['CardMeta']
+        )
+        # 최근값 칩도 동일하게 줄바꿈: '최근' 1줄 + 값 1줄
+        chip = _chip(f"최근<br/>{_nobr_num_unit(fmt(l), unit)}", warn=warn)
+        range_p = Paragraph(_range_text(lo,hi), styles['CardRange'])
+
+        # 내부 콘텐츠 테이블
+        content = Table(
+            [[title],
+             [avg_p],
+             [chip],
+             [Spacer(1, 2)],     # 칩과 범위 사이 미세 여백
+             [range_p]],
+            colWidths=[card_w]
+        )
+        content.setStyle(TableStyle([
+            ('ALIGN',        (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING',  (0,0), (-1,-1), 6),
+            ('RIGHTPADDING', (0,0), (-1,-1), 6),
+            ('TOPPADDING',   (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING',(0,0), (-1,-1), 5),
+        ]))
+
+        # 고정 높이 대신 "최소 높이"로 설정 → 오버플로우 방지
+        card_box = Table([[content]], colWidths=[card_w])
+        card_box.setStyle(TableStyle([
+            ('ALIGN',        (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING',   (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING',(0,0), (-1,-1), 0),
+            ('BACKGROUND',   (0,0), (-1,-1), colors.white),          # 연한 배경 쓰려면 "#F8FAFC"
+            ('BOX',          (0,0), (-1,-1), 0.3, colors.HexColor("#E5E7EB")),
+            ('MINROWHEIGHT', (0,0), (-1,-1), card_h),
+            # ('ROUNDRECT',   (0,0), (-1,-1), 4, 4),  # 모서리 둥글게 원하면 주석 해제
+        ]))
+        card_cells.append([card_box])
+
+    # 6개 카드를 가터 포함 가로 1줄로 배치
+    # colWidths: [card, gutter, card, gutter, ...]
+    cols = []
+    for i in range(6):
+        cols.append(card_w)
+        if i < 5:
+            cols.append(gutter)
+    row = []
+    for i, cell in enumerate(card_cells):
+        row.append(cell[0])
+        if i < 5:
+            row.append('')
+    cards_row = Table([row], colWidths=cols, hAlign='CENTER')
+    cards_row.setStyle(TableStyle([
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING',   (0,0), (-1,-1), 0),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 0),
+        ('TOPPADDING',    (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
     ]))
-    # 테이블도 확실히 폰트 지정
-    avg_table.setStyle(TableStyle([
-        ('FONTNAME',(0,0),(-1,-1),BASE_FONT),
-    ]))
-    story.append(avg_table)
+    story.append(cards_row)
     story.append(Spacer(1, 0.5*cm))
 
     # 표준범위 로딩
@@ -599,10 +717,10 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
             print(f"[WARN] standards second try failed: {e}")
     
     
-    # ── 2열 레이아웃: 좌(주변 온도/습도/조도), 우(토양 온도/수분/전도도) ──
+    # ── 2열 레이아웃: 좌(환경 온도/습도/조도), 우(토양 온도/수분/전도도) ──
     left_fields  = [
-        ("temperature","주변 온도 (°C)"),
-        ("humidity","주변 습도 (%)"),
+        ("temperature","온도 (°C)"),
+        ("humidity","습도 (%)"),
         ("light_lux","조도 (lux)"),
     ]
     right_fields = [
@@ -611,7 +729,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ("soil_ec","토양 전도도 (uS/cm)"),
     ]
 
-    col_w = 9.6*cm          # 각 칸 너비
+    col_w = 9.3*cm          # 각 칸 너비
     img_h = 4.3*cm          # 그래프 높이 (한 페이지 3개씩)
 
     def build_metric_block(field, label):
@@ -632,17 +750,21 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         # 요약 텍스트
         import math as _math
         vals = [float(x) for x in v_list if x is not None and not (_math.isnan(x) if isinstance(x, float) else False)]
+        def _cap(text):
+            # 캡션 1줄 고정(넘치면 말줄임), 폰트 축소 금지
+            html = f"<font size=9 color='#64748B'>{text}</font>"
+            p = Paragraph(html, styles['NotoNormal'])
+            return KeepInFrame(col_w, 0.65*cm, [p], mode='truncate', hAlign='CENTER', vAlign='TOP')
+
         if lo is None and hi is None:
-            parts.append([Paragraph("※ 이 항목의 정상 범위를 찾을 수 없어 비교를 생략했습니다.", styles['NotoNormal'])])
+            parts.append([_cap("정상 범위를 찾을 수 없어 이탈 횟수 집계 불가")])
         else:
-            lo_s = f"{lo:.0f}" if lo is not None else "-"
-            hi_s = f"{hi:.0f}" if hi is not None else "-"
             low_cnt  = sum(1 for x in vals if lo is not None and x <  lo)
             high_cnt = sum(1 for x in vals if hi is not None and x >  hi)
             total_cnt = low_cnt + high_cnt
-            summary_txt = f"정상범위 {lo_s}–{hi_s} 기준, 이번 주 이탈: 낮음 {low_cnt}회 · 높음 {high_cnt}회 (총 {total_cnt}회)"
-            summary_html = f"<font size=9 color='#64748B'>{summary_txt}</font>"
-            parts.append([Paragraph(summary_html, styles['NotoNormal'])])
+            summary_txt = f"정상 범위 이탈 횟수: 낮음 {low_cnt}회, 높음 {high_cnt}회 (총 {total_cnt}회)"
+            parts.append([_cap(summary_txt)])
+            
         # 칸 안 여백
         parts.append([Spacer(1, 0.25*cm)])
         t = Table(parts, colWidths=[col_w])
@@ -669,8 +791,12 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
             ('BOTTOMPADDING',(0,0), (-1,-1), 0),
         ]))
 
-    # 두 컬럼 사이 가터(여백) 0.8cm 확보를 위해 빈 열을 끼운 3열 테이블 사용
-    grid = Table([[left_column, '', right_column]], colWidths=[col_w, 0.8*cm, col_w], hAlign='LEFT')
+    # 두 컬럼 + 중간 가터 → 중앙 정렬
+    grid = Table(
+        [[left_column, '', right_column]],
+        colWidths=[col_w, 0.8*cm, col_w],
+        hAlign='CENTER'
+    )
     grid.setStyle(TableStyle([
         ('VALIGN',        (0,0), (-1,-1), 'TOP'),
         ('LEFTPADDING',   (0,0), (-1,-1), 0),
