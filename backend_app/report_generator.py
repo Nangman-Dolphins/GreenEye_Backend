@@ -24,7 +24,7 @@ from email.header import Header
 from email.utils import formataddr
 from dotenv import load_dotenv
 from .services import connect_influxdb, query_influxdb_data, get_influx_client
-from .database import get_db_connection, get_all_devices_any, get_all_users, get_device_by_device_id_any
+from .database import get_db_connection, get_all_devices_any, get_all_users, get_device_by_device_id_any, get_all_devices
 from pathlib import Path
 import pandas as pd
 from typing import List, Tuple, Optional
@@ -713,6 +713,50 @@ def send_email_with_pdf(to_email, subject, body_text, pdf_path):
         print(f"이메일 전송 오류: {e}")
         return False
 
+# 계정이 하나일 때, PDF를 한 통으로 묶어 전송
+def send_email_with_pdfs(to_email: str, subject: str, body_text: str, pdf_paths: list[str]) -> bool:
+    msg = MIMEMultipart()
+    if not EMAIL_USERNAME:
+        print("[WARN] EMAIL_USERNAME not set. Skipping email send; PDFs only.")
+        return False
+    msg["From"] = formataddr(("GreenEye", EMAIL_USERNAME))
+    msg["To"] = to_email
+    msg["Subject"] = Header(subject, "utf-8")
+    msg.attach(MIMEText(body_text, "plain", _charset="utf-8"))
+
+    attached = 0
+    for p in pdf_paths:
+        try:
+            if not p or not os.path.exists(p):
+                print(f"[WARN] skip attach (not found): {p}")
+                continue
+            with open(p, "rb") as f:
+                part = MIMEApplication(f.read(), _subtype="pdf")
+            part.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=(Header(os.path.basename(p), "utf-8").encode()),
+            )
+            msg.attach(part)
+            attached += 1
+        except Exception as e:
+            print(f"[WARN] attach failed: {p} ({e})")
+
+    if attached == 0:
+        print("[WARN] no attachments -> skip sending")
+        return False
+
+    try:
+        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=20) as server:
+            server.ehlo(); server.starttls(); server.ehlo()
+            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+            server.send_message(msg)
+        print(f"[OK] bundled mail sent to {to_email} with {attached} attachments")
+        return True
+    except Exception as e:
+        print(f"[ERR] bundled email send failed: {e}")
+        return False
+
 def send_all_reports():
     print(f"\n--- PDF 보고서 전송 시작: {datetime.now()} ---")
     users = get_all_users()
@@ -737,8 +781,49 @@ def send_all_reports():
             send_email_with_pdf(email, subject, body, pdf)
     print(f"--- PDF 보고서 전송 완료 ---\n")
 
+# 사용자별로 소유 디바이스 PDF를 모아서 한 통으로 발송
+def send_all_reports_grouped(days: int = 7):
+    print(f"\n--- 그룹 전송 시작(days={days}): {datetime.now()} ---")
+    _users   = get_all_users() or []
+    users    = [dict(u) if not isinstance(u, dict) else u for u in _users]
+    _devices = get_all_devices_any() or []
+    devices  = [dict(d) if not isinstance(d, dict) else d for d in _devices]
+    now      = datetime.now().astimezone(pytz.utc)
+    start    = now - timedelta(days=days)
+
+    for u in users:
+        email = u.get("email")
+        uid   = u.get("id")
+        if not email or uid is None:
+            continue
+        # 미리 읽어둔 목록에서 owner_user_id 매칭 (문자열/정수 불일치 대비)
+        owned = [d for d in devices if str(d.get("owner_user_id")) == str(uid)]
+        # 폴백: 미리 읽은 devices에 owner_user_id가 없을 수도 있으므로, 사용자별 쿼리 함수(get_all_devices) 사용
+        if not owned:
+            _owned = get_all_devices(uid) or []
+            owned  = [dict(d) if not isinstance(d, dict) else d for d in _owned]
+            print(f"[DEBUG] fallback devices for user_id={uid}: {len(owned)} found")
+        if not owned:
+            print(f"[INFO] skip {email}: no devices")
+            continue
+
+        pdfs = []
+        for d in owned:
+            dev   = d.get("device_id")
+            fname = d.get("friendly_name") or dev
+            plant = d.get("plant_type")
+            room  = d.get("room")
+            print(f"[INFO] generate PDF → user={email}, device={dev} ({fname})")
+            path = generate_pdf_report_by_device(dev, start, now, fname, plant, room)
+            pdfs.append(path)
+
+        subject = f"GreenEye 주간 식물 보고서 - {len(pdfs)}개 디바이스"
+        body    = "안녕하세요, GreenEye입니다.\n주간 식물 생장 보고서를 보내드립니다."
+        send_email_with_pdfs(email, subject, body, pdfs)
+    print(f"--- 그룹 전송 완료 ---\n")
+
 if __name__ == "__main__":
-    send_all_reports()
+    send_all_reports_grouped()
     # --- InfluxDB 클라이언트 정리 ---
     try:
         cli = get_influx_client()
