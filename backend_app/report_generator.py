@@ -514,9 +514,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
 
     # 좌측 셀 구성: 로고가 있으면 2행짜리 중첩 테이블(로고 / 제목), 없으면 제목만
     if _logo_img:
-        left_nested = Table([[ _logo_img ],
-                             [ title_p ]],
-                            colWidths=[12.0*cm])  # 좌측 영역 폭(임의)
+        left_nested = Table([[ _logo_img ], [ title_p ]], colWidths=[11.8*cm])
         left_nested.setStyle(TableStyle([
             ('ALIGN',        (0,0), (-1,-1), 'LEFT'),
             ('VALIGN',       (0,0), (-1,-1), 'TOP'),
@@ -529,8 +527,16 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     else:
         left_cell = title_p
 
-    # 같은 행에 좌:로고+제목, 우:메타
-    header = Table([[left_cell, right_nested]], colWidths=[11.8*cm, 8.2*cm], hAlign='LEFT')
+    usable = doc.width
+    # 좌우 비율은 카드 폭과 관계없이 좌:우 = 0.6:0.4 정도로 설정
+    header_left_w  = usable * 0.60
+    header_right_w = usable - header_left_w
+    if isinstance(left_cell, Table):
+        left_cell._argW[0] = header_left_w
+    # 헤더도 중앙 정렬
+    header = Table([[left_cell, right_nested]],
+                   colWidths=[header_left_w, header_right_w],
+                   hAlign='CENTER')
     header.setStyle(TableStyle([
         ('VALIGN',        (0,0), (-1,-1), 'TOP'),
         ('ALIGN',         (0,0), (0,0),   'LEFT'),
@@ -625,9 +631,9 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ("토양 전도도", "soil_ec",       "uS/cm",  "soil_ec"),
     ]
 
-    # 한 줄에 6개: 총 유효폭 20cm, 가터 0.2cm × 5 → 카드 폭
+    # 한 줄에 6개: 총 유효폭 = doc.width, 가터 0.15cm × 5 → 카드 폭
     gutter = 0.15*cm
-    card_w = (20*cm - gutter*5) / 6.0
+    card_w = (usable - gutter*5) / 6.0
     card_h = 3.8*cm
 
     card_cells = []
