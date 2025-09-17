@@ -670,22 +670,29 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
 
         # 고정 높이 대신 "최소 높이"로 설정 → 오버플로우 방지
         card_box = Table([[content]], colWidths=[card_w])
+        # 기본 테두리 색(중립): 연회색
+        border_color = colors.HexColor("#CBD5E1")     # gray-300
+        # 값이 정상 범위를 벗어나면 ‘부드러운 파스텔’로만 강조
+        if l is not None:
+            if lo is not None and l < lo:
+                border_color = colors.HexColor("#93C5FD")
+            elif hi is not None and l > hi:
+                border_color = colors.HexColor("#FCA5A5")
+            # 만약 "토양 전도도"처럼 특정 항목에 초록 강조를 쓰고 싶다면 여기서 분기 가능
+
         card_box.setStyle(TableStyle([
-            ('ALIGN',        (0,0), (-1,-1), 'LEFT'),
-            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
-            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING', (0,0), (-1,-1), 0),
-            ('TOPPADDING',   (0,0), (-1,-1), 0),
-            ('BOTTOMPADDING',(0,0), (-1,-1), 0),
-            ('BACKGROUND',   (0,0), (-1,-1), colors.white),          # 연한 배경 쓰려면 "#F8FAFC"
-            ('BOX',          (0,0), (-1,-1), 0.3, colors.HexColor("#E5E7EB")),
-            ('MINROWHEIGHT', (0,0), (-1,-1), card_h),
-            # ('ROUNDRECT',   (0,0), (-1,-1), 4, 4),  # 모서리 둥글게 원하면 주석 해제
+            ('TOPPADDING', (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+            ('BACKGROUND', (0,0), (-1,-1), colors.white),
+            ('BOX', (0,0), (-1,-1), 0.6, border_color),
         ]))
         card_cells.append([card_box])
 
     # 6개 카드를 가터 포함 가로 1줄로 배치
-    # colWidths: [card, gutter, card, gutter, ...]
     cols = []
     for i in range(6):
         cols.append(card_w)
@@ -698,10 +705,10 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
             row.append('')
     cards_row = Table([row], colWidths=cols, hAlign='CENTER')
     cards_row.setStyle(TableStyle([
-        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
-        ('LEFTPADDING',   (0,0), (-1,-1), 0),
-        ('RIGHTPADDING',  (0,0), (-1,-1), 0),
-        ('TOPPADDING',    (0,0), (-1,-1), 0),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
         ('BOTTOMPADDING', (0,0), (-1,-1), 0),
     ]))
     story.append(cards_row)
@@ -729,8 +736,8 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ("soil_ec","토양 전도도 (uS/cm)"),
     ]
 
-    col_w = 9.3*cm          # 각 칸 너비
-    img_h = 4.3*cm          # 그래프 높이 (한 페이지 3개씩)
+    col_w = 9.3*cm
+    img_h = 4.3*cm 
 
     def build_metric_block(field, label):
         # 값 목록만 추출 (요약 계산용)
@@ -783,12 +790,12 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     right_column = Table([[build_metric_block(f,l)] for f,l in right_fields], colWidths=[col_w])
     for col in (left_column, right_column):
         col.setStyle(TableStyle([
-            ('ALIGN',        (0,0), (-1,-1), 'LEFT'),
-            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
-            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING', (0,0), (-1,-1), 0),
-            ('TOPPADDING',   (0,0), (-1,-1), 0),
-            ('BOTTOMPADDING',(0,0), (-1,-1), 0),
+            ('TOPPADDING', (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 0),
         ]))
 
     # 두 컬럼 + 중간 가터 → 중앙 정렬
@@ -798,10 +805,10 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         hAlign='CENTER'
     )
     grid.setStyle(TableStyle([
-        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
-        ('LEFTPADDING',   (0,0), (-1,-1), 0),
-        ('RIGHTPADDING',  (0,0), (-1,-1), 0),
-        ('TOPPADDING',    (0,0), (-1,-1), 0),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
         ('BOTTOMPADDING', (0,0), (-1,-1), 0),
     ]))
     story.append(grid)
