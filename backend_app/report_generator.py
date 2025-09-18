@@ -12,7 +12,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm, mm
 from reportlab.lib import colors
-from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepInFrame)
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepInFrame, KeepTogether)
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors
@@ -551,7 +551,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ('BOTTOMPADDING', (1,0), (1,0), 1),
     ]))
     story.append(header)
-    story.append(Spacer(1, 0.3*cm))
+    story.append(Spacer(1, 0.2*cm))
 
     # 데이터가 없을 때도 헤더는 보이도록, 여기서 처리
     if not rows:
@@ -743,7 +743,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     ]
 
     col_w = 9.3*cm
-    img_h = 4.3*cm 
+    img_h = 4.05*cm 
 
     def build_metric_block(field, label):
         # 값 목록만 추출 (요약 계산용)
@@ -818,6 +818,150 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         ('BOTTOMPADDING', (0,0), (-1,-1), 0),
     ]))
     story.append(grid)
+    
+    # ── AI 한줄 코멘트 & 관리 팁 ──────────────────────────────
+    styles.add(ParagraphStyle(name='AiBoxTitle',
+        parent=styles['NotoHeading4'], fontSize=11, leading=13))
+    styles.add(ParagraphStyle(name='AiBoxText',
+        parent=styles['NotoNormal'], fontSize=9.3, leading=11))
+
+    story.append(Spacer(1, 0.3*cm))
+
+    # 주간 평가용 시계열/요약 헬퍼
+    def _wk_seq(rows, k):
+        return [(r["_time"], float(r[k])) for r in (rows or []) if r.get("_time") and r.get(k) is not None]
+    def _wk_eval(seq, lo, hi):
+        vals  = [v for _, v in seq]
+        times = [t for t, _ in seq]
+        total = len(vals)
+        if total == 0:
+           return {"total":0,"rate_in":0.0,"low":0,"high":0,"hours":0.0,"dom":"in"}
+        in_mask = [((lo is None or v >= lo) and (hi is None or v <= hi)) for v in vals]
+        in_cnt  = sum(in_mask)
+        low_cnt  = sum(1 for v in vals if lo is not None and v < lo)
+        high_cnt = sum(1 for v in vals if hi is not None and v > hi)
+        iv = find_out_of_range_intervals(times, vals, lo, hi) or []
+        hours = sum((b-a).total_seconds() for a,b,_ in iv) / 3600.0
+        # 우세(high/low) 판정 (약간의 여유 폭)
+        if high_cnt > max(3, low_cnt * 1.2):
+            dom = "high"
+        elif low_cnt > max(3, high_cnt * 1.2):
+            dom = "low"
+        else:
+            dom = "in"
+        return {"total":total,"rate_in":in_cnt/total,"low":low_cnt,"high":high_cnt,"hours":hours,"dom":dom}
+
+    def _compose_line(label, key, std_key):
+        seq = _wk_seq(rows, key)
+        if not seq:
+            return f"<b>{label}</b>: 이번 주 데이터가 없었어요."
+        lo, hi = get_range(standards_df, plant_type, std_key)
+        if lo is None and hi is None:
+            return f"<b>{label}</b>: 이번 주는 정상 범위를 알 수 없어요."
+
+        ev = _wk_eval(seq, lo, hi)
+        r   = ev["rate_in"]
+        dom = ev["dom"]
+
+        # 1) 상태 문구: 주간 '정상 비율' 중심
+        if r >= 0.85:
+            status = "이번 주는 정상 범위에서 안정적이었어요."
+        elif r >= 0.60:
+            status = "대체로 정상 범위였지만 간헐적으로 벗어났어요."
+        else:
+            if dom == "high":
+                status = "이번 주는 기준보다 높은 구간이 많았어요."
+            elif dom == "low":
+                status = "이번 주는 기준보다 낮은 구간이 많았어요."
+            else:
+                status = "정상 범위를 자주 벗어났어요."
+
+        # 2) 우세 방향 + 센서별 친절 조언
+        advice = ""
+        if key == "temperature":
+            advice = ("낮에는 환기·차광을 해주세요." if dom == "high"
+                      else ("야간 보온에 신경 써주세요." if dom == "low" else ""))
+        elif key == "humidity":
+            advice = ("분무나 가습을 조금 더 자주 해주세요." if dom == "low"
+                      else ("환기로 과습을 방지해 주세요." if dom == "high" else ""))
+        elif key == "light_lux":
+            advice = ("조금 더 밝은 위치로 옮겨주세요." if dom == "low"
+                else ("직사광선이 강하면 커튼이나 가림막을 사용해 주세요." if dom == "high" else ""))
+        elif key == "soil_temp":
+            advice = ("뿌리 과열을 막기 위해 차광·환기를 해주세요." if dom == "high"
+                else ("보온 덮개나 따뜻한 위치로 옮겨 주세요." if dom == "low" else ""))
+        elif key == "soil_moisture":
+            advice = ("급수 주기를 하루 당겨 보세요." if dom == "low"
+                      else ("과습 주의, 배수·통풍을 점검해 주세요." if dom == "high" else ""))
+        elif key == "soil_ec":
+            advice = ("희석 급수로 염류를 씻어내 주세요." if dom == "high"
+                      else ("비료 농도와 급수 빈도를 점검해 주세요." if dom == "low" else ""))
+
+        text = f"<b>{label}</b>: {status}"
+        if advice:
+            text += f"<br/><font color='#64748B'>{advice}</font>"
+        return text
+
+    # 각 센서 항목별 불릿 코멘트
+    ai_lines = []
+    for label, key, unit, std_key in CARD_ITEMS:
+        line = _compose_line(label, key, std_key)
+        if line:
+            ai_lines.append(Paragraph("• " + line, styles['AiBoxText']))
+
+    if ai_lines:
+        ai_title = Paragraph("이번 주 요약 & 다음 주 관리 팁", styles['AiBoxTitle'])
+        # 타이틀 아래 얇은 구분선
+        title_rule = Table([[ai_title]], colWidths=[doc.width-12*mm])
+        title_rule.setStyle(TableStyle([
+            ('LINEBELOW', (0,0), (-1,-1), 0.5, colors.HexColor("#E5E7EB")),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING',(0,0), (-1,-1), 0),
+            ('TOPPADDING',  (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING',(0,0),(-1,-1), 2),
+        ]))
+
+        # 요약 목록을 2열(3개/3개) 테이블로 구성해 높이 절감
+        left_items  = ai_lines[0::2]
+        right_items = ai_lines[1::2]
+        maxlen = max(len(left_items), len(right_items))
+        two_col_rows = []
+        for i in range(maxlen):
+            l = left_items[i]  if i < len(left_items)  else Spacer(1, 0)
+            r = right_items[i] if i < len(right_items) else Spacer(1, 0)
+            two_col_rows.append([l, r])
+        # 좌우 칼럼 폭과 가터
+        inner_width = doc.width - 12*mm
+        gutter = 6*mm
+        colw = (inner_width - gutter) / 2.0
+        lines_2col = Table(two_col_rows, colWidths=[colw, colw], hAlign="LEFT")
+        lines_2col.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING',(0,0), (-1,-1), 0),
+            ('TOPPADDING',  (0,0), (-1,-1), 1),
+            ('BOTTOMPADDING',(0,0), (-1,-1), 1),
+            # 칼럼 사이 가터를 넣기 위해 빈 컬럼 대신 내부 오른쪽 패딩만 살짝
+        ]))
+
+        inner = KeepInFrame(
+            maxWidth=doc.width-12*mm,
+            maxHeight=3.4*cm,
+            content=[title_rule, lines_2col],
+            mode="shrink",
+            hAlign="LEFT", vAlign="TOP"
+        )
+        ai_box = Table([[inner]], colWidths=[doc.width], hAlign="CENTER")
+        ai_box.setStyle(TableStyle([
+            ('LEFTPADDING',   (0,0), (-1,-1), 4),
+            ('RIGHTPADDING',  (0,0), (-1,-1), 4),
+            ('TOPPADDING',    (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('BOX',           (0,0), (-1,-1), 0.7, colors.HexColor("#CBD5E1")),
+            ('BACKGROUND',    (0,0), (-1,-1), colors.white),
+        ]))
+        story.append(ai_box)
+        story.append(Spacer(1, 0.2*cm))
 
     # PDF 저장
     doc.build(story)
