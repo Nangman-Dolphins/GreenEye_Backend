@@ -477,9 +477,11 @@ def process_incoming_data(topic: str, payload):
                     img_with_stamp = img_enhanced.copy() # copy for draw timestamp
                     draw = ImageDraw.Draw(img_with_stamp)
 
-                    timestamp_text = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    current_time = datetime.now()
+                    timestamp_text = current_time.strftime('{device_id}_%Y-%m-%d %H:%M:%S')
+
                     try:
-                        font = ImageFont.truetype("arial.ttf", size=35) #font select
+                        font = ImageFont.truetype("arial.ttf", size=20) #font select
                     except IOError:
                         font = ImageFont.load_default()
 
@@ -502,7 +504,7 @@ def process_incoming_data(topic: str, payload):
                     image_base16 = base64.b16encode(enhanced_image_bytes)
                     image_base16_str = image_base16.decode('UTF-8')
 
-                    filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                    filename = f"{device_id}_{current_time.strftime('%Y%m%d%H%M%S')}"
                     filename_jpg = f"{filename}.jpg"
                     filename_jpg_wStamp = f"{filename}_wstamp.jpg"
                     filename_origin = f"{filename}.b16"
