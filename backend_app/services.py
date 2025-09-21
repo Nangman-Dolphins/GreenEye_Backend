@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from werkzeug.utils import secure_filename
 import re
 import base64
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont
 from io import BytesIO
 
 
@@ -443,8 +443,10 @@ def process_incoming_data(topic: str, payload):
         # --- 데이터 종류에 따라 분기 처리 (plant_img 키 유무로 판단) ---
         if "plant_img" in payload:
             try: 
-                # 이미지 데이터 처리
-                # ~.jpg로 사진 파일 저장, ~.origin으로 base16 텍스트 원본 저장
+                # Handling Image Data
+                # ~.jpg for enhanced image data
+                # ~_wstamp.jpg for enhanced image data with timestamp
+                # ~.b16 for base16 encoded text data
                 image_base64 = payload.get("plant_img")
                 if image_base64 and isinstance(image_base64, str):
                     image_dec = base64.b64decode(image_base64)
@@ -472,21 +474,49 @@ def process_incoming_data(topic: str, payload):
                     img_enhanced.save(buffer, 'JPEG', quality=100)
                     enhanced_image_bytes = buffer.getvalue()
 
+                    img_with_stamp = img_enhanced.copy() # copy for draw timestamp
+                    draw = ImageDraw.Draw(img_with_stamp)
+
+                    timestamp_text = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    try:
+                        font = ImageFont.truetype("arial.ttf", size=35) #font select
+                    except IOError:
+                        font = ImageFont.load_default()
+
+                    img_width, img_height = img_with_stamp.size
+                    bbox = draw.textbbox((0, 0), timestamp_text, font=font)
+                    text_width = bbox[2] - bbox[0]
+                    text_height = bbox[3] - bbox[1]
+                    margin = 15
+                    x = img_width - text_width - margin
+                    y = img_height - text_height - margin
+
+                    # draw timestamp
+                    draw.text((x, y), timestamp_text, font=font, fill="white", stroke_width=2, stroke_fill="black")
+
+                    # save wstamp
+                    buffer_wstamp = BytesIO()
+                    img_with_stamp.save(buffer_wstamp, 'JPEG', quality=100)
+                    stamped_image_bytes = buffer_wstamp.getvalue()
 
                     image_base16 = base64.b16encode(enhanced_image_bytes)
                     image_base16_str = image_base16.decode('UTF-8')
 
                     filename = f"{device_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
                     filename_jpg = f"{filename}.jpg"
-                    filename_origin = f"{filename}.origin"
+                    filename_jpg_wStamp = f"{filename}_wstamp.jpg"
+                    filename_origin = f"{filename}.b16"
 
                     path_jpg = os.path.join(IMAGE_UPLOAD_FOLDER, filename_jpg)
+                    path_jpg_wStamp = os.path.join(IMAGE_UPLOAD_FOLDER, filename_jpg_wStamp)
                     path_origin = os.path.join(IMAGE_UPLOAD_FOLDER, filename_origin)
 
                     os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
 
                     with open(path_jpg, "wb") as f:
                         f.write(enhanced_image_bytes)
+                    with open(path_jpg_wStamp, "wb") as f:
+                        f.write(stamped_image_bytes)
                     with open(path_origin, "w", encoding="utf-8") as f:
                         f.write(image_base16_str)
 
