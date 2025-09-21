@@ -42,9 +42,11 @@ from .database import (
     add_device,
     get_device_by_device_id,        
     get_device_by_device_id_any,               
-    get_all_devices,             # (유저별 조회용)
-    get_all_devices_any,         # (전체 조회용) 여기! 수정함!!    
+    get_all_devices,
+    get_all_devices_any,
 )
+
+from backend_app.database import get_db_connection  # 최신 이미지 DB 폴백용
 
 from backend_app.control_logic import (
     handle_manual_control,
@@ -76,6 +78,21 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 CORS(app, resources={r"/api/*": {
     "origins": ["http://localhost:5173", "http://localhost:3000"]
 }})
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get("Authorization")
+        if not token or not token.startswith("Bearer "):
+            return jsonify({"message": "Token is missing!"}), 401
+        token = token.split(" ")[1]
+        try:
+            data = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+            g.current_user = get_user_by_email(data["email"])
+        except jwt.PyJWTError as e:
+            return jsonify({"message": "Token is invalid!", "error": str(e)}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 if not hasattr(app, "before_first_request"):
     _run_once_lock = Lock()
@@ -172,17 +189,110 @@ def _delete_all_images_for_device(device_id: str) -> int:
             pass
     return removed
 
-# Influx 기본 설정 (측정명 기본값 보강!)
+def _image_public_url(device_id: str, filename: str) -> str:
+    """
+    프론트에서 바로 <img src> 로 쓸 수 있는 내부 API URL 생성.
+    기존 이미지 서빙 라우트(`/api/images/<device_id>/<filename>`)를 그대로 활용.
+    """
+    if not filename:
+        return None
+    safe = secure_filename(filename)
+    return f"/api/images/{device_id}/{safe}"
+
+def _get_latest_image_row_from_db(device_id: str):
+    """
+    Redis에 최신 포인터가 없을 때 DB `plant_images`에서 가장 최근 이미지를 1건 가져온다.
+    services.py의 process_incoming_data가 이 테이블에 적재함. (filename, filepath, timestamp 등)
+    """
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT filename, filepath, timestamp FROM plant_images WHERE device_id=? ORDER BY timestamp DESC LIMIT 1",
+                (device_id,)
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        print(f"[latest-image] DB fallback failed for {device_id}: {e}")
+        return None
+
+def _compose_latest_image_payload(device, include_ai: bool = True):
+    """
+    device(dict): get_device_by_device_id() 가 반환한 장치 레코드
+    - Redis `latest_image:{device_id}` → DB plant_images 폴백 → 페이로드 생성
+    - AI 진단은 Redis `latest_ai_diagnosis:{device_id}` 에서 함께 포함(선택)
+    """
+    device_id = device["device_id"]
+
+    # Redis 최신 포인터 조회
+    latest = get_redis_data(f"latest_image:{device_id}") or {}
+    filename = latest.get("filename")
+    timestamp = latest.get("timestamp")
+
+    # 폴백: DB 최근 이미지 1건
+    if not filename:
+        row = _get_latest_image_row_from_db(device_id)
+        if row:
+            # services.py는 filepath에 풀 경로, filename에는 접두 없는 파일명 저장
+            # 여기서는 filename만 쓰고, 내려줄 URL은 기존 이미지 라우트로 구성
+            filename = row.get("filename")
+            timestamp = row.get("timestamp")
+
+    payload = {
+        "device_id": device_id,
+        "friendly_name": device.get("friendly_name") or device_id,
+        "filename": filename,
+        "timestamp": timestamp,
+        "image_url": _image_public_url(device_id, filename) if filename else None,
+    }
+
+    # (옵션) 최신 AI 진단 포함
+    if include_ai:
+        ai = get_redis_data(f"latest_ai_diagnosis:{device_id}") or None
+        if ai:
+            payload["ai"] = ai
+
+    return payload
+
+@app.get("/api/devices/<device_id>/latest-image")
+@token_required
+def api_latest_image(device_id: str):
+    """
+    단일 디바이스의 최신 이미지를 반환.
+    - Redis `latest_image:{device_id}` 우선
+    - 없으면 DB `plant_images`의 최근 레코드로 폴백
+    - 최종 URL은 기존 `/api/images/<device_id>/<filename>` 로 접근
+    """
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
+    if not dev:
+        return jsonify({"error": "Device not found"}), 404
+
+    info = _compose_latest_image_payload(dev, include_ai=True)
+    if not info.get("filename"):
+        return jsonify({"error": "No image found"}), 404
+    return jsonify(info), 200
+
+@app.get("/api/devices/latest-images")
+@token_required
+def api_latest_images_for_user():
+    """
+    현재 사용자 소유 모든 디바이스의 최신 이미지를 묶어서 반환.
+    쿼리 ?limit=N 은 향후 갤러리 확장 시를 위해 예약(현재는 단건).
+    """
+    owner_user_id = g.current_user["id"]
+    devices = get_all_devices(owner_user_id) or []
+    results = []
+    for d in devices:
+        results.append(_compose_latest_image_payload(d, include_ai=True))
+    return jsonify(results), 200
+
+# Influx 기본 설정
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
 INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "sensor_readings")
 
 DEVICE_PREFIX = os.getenv("DEVICE_PREFIX", "ge-sd")
 
 def normalize_device_id(raw: str) -> str:
-    """
-    'ge-sd-6c18' 같은 입력을 내부용 짧은 ID '6c18'으로 변환.
-    이미 '6c18'이면 그대로 반환.
-    """
     if not raw:
         return raw
     r = raw.strip().lower()
@@ -190,14 +300,10 @@ def normalize_device_id(raw: str) -> str:
     return m.group(1) if m else r
 
 def to_device_code(short_id: str) -> str:
-    """
-    짧은 ID '6c18' -> 'ge-sd-6c18' 으로 표시용 코드 변환.
-    """
     sid = (short_id or "").strip().lower()
     return f"{DEVICE_PREFIX}-{sid}" if re.fullmatch(r"[0-9a-f]{4}", sid) else short_id
 
 def _to_device_id_from_any(s: str) -> str:
-    """MAC(aa:bb:...) / ge-sd-XXXX / 그냥 XXXX 모두에서 마지막 4자리로 device_id 생성"""
     if not s:
         return ""
     t = s.strip()
@@ -207,12 +313,6 @@ def _to_device_id_from_any(s: str) -> str:
     return t[-4:].lower()
 
 def _normalize_mac_like(s: str) -> str:
-    """
-    저장용 mac_address 표준화:
-    - 'ge-sd-XXXX' 형태면 그대로 대문자 접미부로 보정
-    - 일반 MAC이면 콜론 포함 대문자
-    - 4~6글자 같은 짧은 식별자면 'ge-sd-XXXX'로 만들어 저장
-    """
     if not s:
         return s
     t = s.strip()
@@ -248,27 +348,11 @@ def get_latest_sensor_data_from_redis(device_id: str):
 def get_latest_ai_from_redis(device_id: str):
     return get_redis_data(_redis_key_latest_ai(device_id)) or None
 
-# DB에서 친화 이름 조회
+# DB에서 friendly_name 조회
 def get_friendly_name(device_id: str) -> str:
     dev = get_device_by_device_id_any(device_id)
     return (dev and dev.get("friendly_name")) or device_id
 
-def token_required(f):
-    @wraps(f) 
-    def decorated(*args, **kwargs):
-        token = request.headers.get("Authorization")
-        if not token or not token.startswith("Bearer "):
-            return jsonify({"message": "Token is missing!"}), 401
-
-        token = token.split(" ")[1]
-        try:
-            data = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
-            g.current_user = get_user_by_email(data["email"])
-        except jwt.PyJWTError as e:
-            return jsonify({"message": "Token is invalid!", "error": str(e)}), 401
-
-        return f(*args, **kwargs)
-    return decorated
 
 
 @app.before_first_request
@@ -380,9 +464,79 @@ def api_latest_sensor_data(device_id):
     # Redis → Influx 폴백은 기존 로직 그대로
     data = get_latest_sensor_data_from_redis(device_id)
     ai   = get_latest_ai_from_redis(device_id)
-    if not data:
-        return jsonify({"error": "No data found"}), 404
-
+    # Redis가 없거나 값이 비어 있으면 Influx 폴백
+    def _is_empty_payload(d: dict) -> bool:
+        if not d: return True
+        keys = ["temperature","humidity","light_lux","soil_moisture","soil_ec","soil_temp","battery"]
+        return all(d.get(k) in (None, "", []) for k in keys)
+    if not data or _is_empty_payload(data):
+        flux = f'''
+        from(bucket: "{INFLUXDB_BUCKET}")
+          |> range(start: -7d)
+          |> filter(fn: (r) => r._measurement == "{INFLUX_MEASUREMENT}")
+          |> filter(fn: (r) => r.device_id == "{device_id}")
+          |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
+          |> keep(columns: ["_time","device_id",
+                            "temperature","Temperature",
+                            "humidity","Humidity",
+                            "light_lux","lightLux","light","Light","Lux",
+                            "soil_moisture","soilMoisture",
+                            "soil_ec","soilEC",
+                            "soil_temp","soilTemp",
+                            "battery","Battery"])
+          |> sort(columns: ["_time"], desc: true)
+          |> limit(n: 1)
+        '''
+        rows = query_influxdb_data(flux) or []
+        if rows:
+            r = rows[0]
+            # 필드 alias 대응 + 숫자형 변환
+            rl = {str(k).lower(): r[k] for k in r.keys()}
+            def pick(*names):
+                for n in names:
+                    if n in r and r[n] not in (None, ""):
+                        return r[n]
+                for n in names:
+                    v = rl.get(str(n).lower())
+                    if v not in (None, ""):
+                        return v
+                return None
+            def to_num(x):
+                try:
+                    # 이미 숫자면 그대로
+                    if isinstance(x, (int, float)):
+                        return x
+                    if x is None or x == "":
+                        return None
+                    return float(str(x))
+                except Exception:
+                    return None
+            data = {
+                "timestamp": pick("_time", "time"),
+                "temperature": to_num(pick("temperature","Temperature")),
+                "humidity": to_num(pick("humidity","Humidity")),
+                "light_lux": to_num(pick("light_lux","lightLux","light","Light","Lux")),
+                "soil_moisture": to_num(pick("soil_moisture","soilMoisture")),
+                "soil_ec": to_num(pick("soil_ec","soilEC")),
+                "soil_temp": to_num(pick("soil_temp","soilTemp")),
+                "battery": to_num(pick("battery","Battery")),
+            }
+        else:
+            return jsonify({"error": "No data found"}), 404
+    else:
+        # Redis 경로도 숫자형으로 정규화(문자열 숫자 → float)
+        def to_num(x):
+            try:
+                if isinstance(x, (int, float)):
+                    return x
+                if x is None or x == "":
+                    return None
+                return float(str(x))
+            except Exception:
+                return None
+        for k in ["temperature","humidity","light_lux","soil_moisture","soil_ec","soil_temp","battery"]:
+            if k in data:
+                data[k] = to_num(data.get(k))
     # 여기서 상태값을 계산해서 프론트로 전달
     plant_type = dev.get("plant_type")
     values = classify_payload(plant_type, data)
@@ -462,7 +616,7 @@ def get_historical_sensor_data(device_id: str):
           |> limit(n: 50)
         '''
         raw = query_influxdb_data(flux_raw) or []
-        # raw를 time 기준으로 필드 병합 (간단 버전)
+        # raw를 time 기준으로 필드 병합s
         by_time = {}
         for r in raw:
             t = r.get("_time")
@@ -481,6 +635,85 @@ def get_historical_sensor_data(device_id: str):
         row["friendly_name"] = dev["friendly_name"]
 
     return jsonify(data)
+
+# --- 디버그: Influx 폴백 원시 1건을 그대로 확인 ---
+@app.get("/api/debug/latest_sensor_raw/<device_id>")
+@token_required
+def debug_latest_sensor_raw(device_id: str):
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
+    if not dev:
+        return jsonify({"error": "Device not found"}), 404
+
+    flux = f'''
+    from(bucket: "{INFLUXDB_BUCKET}")
+      |> range(start: -7d)
+      |> filter(fn: (r) => r._measurement == "{INFLUX_MEASUREMENT}")
+      |> filter(fn: (r) => r.device_id == "{device_id}")
+      |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
+      |> keep(columns: ["_time","device_id","temperature","humidity","light_lux","lightLux","light",
+                        "soil_moisture","soilMoisture","soil_ec","soilEC","soil_temp","soilTemp","battery","Battery"])
+      |> sort(columns: ["_time"], desc: true)
+      |> limit(n: 1)
+    '''
+    rows = query_influxdb_data(flux) or []
+    if not rows:
+        return jsonify({"error": "No data found"}), 404
+    # rows[0]를 그대로 반환(프론트에서 필드 확인용)
+    return jsonify(rows[0]), 200
+
+# ---- 디버그 유틸: 라우트 목록 ----
+@app.get("/api/debug/routes")
+def debug_routes():
+    out = []
+    for rule in app.url_map.iter_rules():
+        out.append({
+            "rule": str(rule),
+            "methods": sorted(list(rule.methods - {'HEAD','OPTIONS'})),
+            "endpoint": rule.endpoint,
+        })
+    out.sort(key=lambda x: x["rule"])
+    return jsonify(out), 200
+
+# ---- 디버그: 셀프체크(어떤 경로를 탔는지) ----
+@app.get("/api/debug/selfcheck/<device_id>")
+@token_required
+def debug_selfcheck(device_id: str):
+    owner_user_id = g.current_user["id"]
+    dev = get_device_by_device_id(device_id, owner_user_id)
+    if not dev:
+        return jsonify({"error": "Device not found"}), 404
+
+    def _is_empty_payload(d: dict) -> bool:
+        if not d:
+            return True
+        keys = ["temperature","humidity","light_lux","soil_moisture","soil_ec","soil_temp","battery"]
+        return all(d.get(k) in (None, "", []) for k in keys)
+
+    redis_data = get_latest_sensor_data_from_redis(device_id)
+    path_used = "redis"
+    chosen = redis_data
+
+    if _is_empty_payload(redis_data or {}):
+        path_used = "influx_fallback"
+        flux = f'''
+        from(bucket: "{INFLUXDB_BUCKET}")
+          |> range(start: -7d)
+          |> filter(fn: (r) => r._measurement == "{INFLUX_MEASUREMENT}")
+          |> filter(fn: (r) => r.device_id == "{device_id}")
+          |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
+          |> sort(columns: ["_time"], desc: true)
+          |> limit(n: 1)
+        '''
+        rows = query_influxdb_data(flux) or []
+        chosen = rows[0] if rows else None
+
+    return jsonify({
+        "device_id": device_id,
+        "path_used": path_used,
+        "redis_has_data": bool(redis_data),
+        "redis_payload_preview_keys": (list(chosen.keys()) if isinstance(chosen, dict) else None)
+    }), 200
 
 @app.route("/api/control_device/<device_id>", methods=["POST"])
 @token_required
