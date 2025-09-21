@@ -486,7 +486,7 @@ def process_incoming_data(topic: str, payload):
                     os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
 
                     with open(path_jpg, "wb") as f:
-                        f.write(image_dec)
+                        f.write(enhanced_image_bytes)
                     with open(path_origin, "w", encoding="utf-8") as f:
                         f.write(image_base16_str)
 
