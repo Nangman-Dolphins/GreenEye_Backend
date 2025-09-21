@@ -1,6 +1,7 @@
 # PDF 보고서 생성
 import os
 import socket
+import json
 from datetime import datetime, timedelta, timezone
 import pytz
 import smtplib
@@ -90,6 +91,21 @@ EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
 EMAIL_USERNAME = os.getenv("EMAIL_USERNAME")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET") or "sensor_data"
+
+def week_window_kst(reference_utc: datetime) -> tuple[datetime, datetime]:
+    """
+    기준 UTC 시각을 받아 KST에서 '지난주 월 00:00 ~ 이번주 월 00:00' 경계를 UTC로 반환.
+    (어느 시각에 실행하든 주간 경계가 KST 기준으로 정확히 맞춰짐)
+    """
+    kst = pytz.timezone("Asia/Seoul")
+    ref_kst = reference_utc.astimezone(kst)
+    # 이번 주 월요일 00:00 (KST)
+    weekday = ref_kst.weekday()  # 0=월
+    this_mon_00 = (ref_kst - timedelta(days=weekday)).replace(hour=0, minute=0, second=0, microsecond=0)
+    # 실행 시점이 월요일 00:00 전이라면 직전 주간으로 당김
+    end_kst = this_mon_00 if ref_kst >= this_mon_00 else this_mon_00 - timedelta(days=7)
+    start_kst = end_kst - timedelta(days=7)
+    return start_kst.astimezone(pytz.utc), end_kst.astimezone(pytz.utc)
 
 def _looks_mojibake(s: Optional[str]) -> bool:
     """
@@ -427,16 +443,29 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         if level >= 15:  return f"매우 낮음 ({level:.2f}%)"
         return f"위험 ({level:.2f}%)"
 
+    
+    
+    raw_device_id = device_id                # 디버그용 원본 보관
+    device_id = str(device_id)               # 어떤 타입이 와도 문자열화
+
+    # 과학적 표기처럼 변형된 케이스 방지: '2e+52' → '2e52'
+    if re.fullmatch(r'^[0-9]+e\+[0-9]+$', device_id, flags=re.I):
+        device_id = device_id.replace('E+','e').replace('e+','e')
+
+    print(f"[DEBUG] device_id raw={raw_device_id!r} -> used={device_id!r}")
+    
     # Influx 쿼리
     start = _fmt_iso_utc(start_dt)
     end   = _fmt_iso_utc(end_dt)
-    #    |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+
+    did = json.dumps(device_id)  # -> 예: "2e52" 같은 정확한 문자열 리터럴 생성
+
     query = f"""
     from(bucket: "{INFLUXDB_BUCKET}")
     |> range(start: {start}, stop: {end})
     |> filter(fn: (r) => r["_measurement"] == "sensor_readings")
-    |> filter(fn: (r) => r["device_id"] == "{device_id}")
-    |>aggregateWindow(every: {REPORT_AGG_WINDOW}, fn: mean, createEmpty: false)
+    |> filter(fn: (r) => r["device_id"] == {did})
+    |> aggregateWindow(every: {REPORT_AGG_WINDOW}, fn: mean, createEmpty: false)
     |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
     |> keep(columns: ["_time","device_id","temperature","humidity","light_lux","soil_moisture","soil_temp","soil_ec","battery"])
     """
@@ -474,8 +503,12 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
     if plant_disp:
         _plant_label = _display_text(plant_disp).replace(" (", "&nbsp;(")
     # ── 메타(우측) 4줄로: 1열×N행 중첩 테이블 ─────────────────────────────
+    # 기간 표기를 KST 기준 날짜로 표시
+    _kst = pytz.timezone("Asia/Seoul")
+    _s_k = start_dt.astimezone(_kst).strftime("%Y-%m-%d")
+    _e_k = end_dt.astimezone(_kst).strftime("%Y-%m-%d")
     meta_lines = [
-        f"기간: {start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}",
+        f"기간: {_s_k} ~ {_e_k}",
         (f"식물: {_plant_label}" if _plant_label else None),
         f"위치: {_display_text(room_disp) or '(미설정)'}",
         (f"배터리: {battery_status_string(latest_battery).replace('(%.2f' , '(%').replace('.00%', '%')}"
@@ -576,9 +609,9 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         vals = [v for v in pick(key) if v is not None]
         return (sum(vals)/len(vals)) if vals else None
     def _range_text(lo, hi):
-        lo_s = "-" if lo is None else (f"{lo:.0f}")
-        hi_s = "-" if hi is None else (f"{hi:.0f}")
-        return f"정상범위: {lo_s}–{hi_s}"
+        lo_s = "-" if lo is None else f"{lo:.0f}"
+        hi_s = "-" if hi is None else f"{hi:.0f}"
+        return f"정상범위:<br/>{lo_s}–{hi_s}"
     def _chip(text, warn=False):
         # 칩(최근값) 배경/테두리
         bg = colors.HexColor("#F1F5F9") if not warn else colors.HexColor("#FDECEC")
@@ -618,6 +651,10 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         fontSize=8.5, leading=11, textColor=colors.HexColor("#64748B")
     ))
     
+    def _shrink(html: str, width: float, height: float, style):
+        p = Paragraph(html, style)
+        return KeepInFrame(width, height, [p], mode="shrink", hAlign="LEFT", vAlign="TOP")
+    
     # 표준범위(카드 경고판단에 사용) - 아래에서 standards_df 재사용됨
     standards_df = load_standards() if 'standards_df' not in locals() else standards_df
 
@@ -648,13 +685,20 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         # 카드 내부(세로 스택)
         title = Paragraph(f"<b>{label}</b>", styles['CardTitle'])
         # 라벨과 값을 확실히 줄바꿈: '평균' 1줄 + '숫자 단위' 1줄
-        avg_p = Paragraph(
+        avg_p = _shrink(
             f"평균<br/><b>{_nobr_num_unit(fmt(a), unit)}</b>",
-            styles['CardMeta']
+            card_w-12, 24, styles['CardMeta']
         )
-        # 최근값 칩도 동일하게 줄바꿈: '최근' 1줄 + 값 1줄
-        chip = _chip(f"최근<br/>{_nobr_num_unit(fmt(l), unit)}", warn=warn)
-        range_p = Paragraph(_range_text(lo,hi), styles['CardRange'])
+        # 최근값도 동일하게 처리(칩 내부에 주입)
+        chip = _chip("", warn=warn)
+        chip._cellvalues = [[
+            _shrink(
+                f"최근<br/>{_nobr_num_unit(fmt(l), unit)}",
+                card_w-12, 24, styles['CardMeta']
+            )
+        ]]
+        # 정상범위도 두 줄(라벨/값)로 고정
+        range_p = Paragraph(_range_text(lo, hi), styles['CardRange'])
 
         # 내부 콘텐츠 테이블
         content = Table(
@@ -858,13 +902,16 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
         lo, hi = get_range(standards_df, plant_type, std_key)
         if lo is None and hi is None:
             return f"<b>{label}</b>: 이번 주는 정상 범위를 알 수 없어요."
-
-        ev = _wk_eval(seq, lo, hi)
-        r   = ev["rate_in"]
-        dom = ev["dom"]
+        
+        ev       = _wk_eval(seq, lo, hi)
+        r        = ev["rate_in"]
+        dom      = ev["dom"]
+        out_cnt  = ev["low"] + ev["high"]
+        is_stable     = (r >= 0.85)           # '안정적' 기준
+        is_borderline = (0.60 <= r < 0.85)    # '대체로 정상' 구간
 
         # 1) 상태 문구: 주간 '정상 비율' 중심
-        if r >= 0.85:
+        if is_stable:
             status = "이번 주는 정상 범위에서 안정적이었어요."
         elif r >= 0.60:
             status = "대체로 정상 범위였지만 간헐적으로 벗어났어요."
@@ -876,30 +923,48 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
             else:
                 status = "정상 범위를 자주 벗어났어요."
 
-        # 2) 우세 방향 + 센서별 친절 조언
+        # 조언 노출 조건
+        # 안정적이면 조언 없음
+        # '대체로 정상'이면 우세 방향(dom != 'in')이고, 아래 임계 중 하나라도 충족해야 조언 표시
+        # '비정상' 구간(r < 0.60)이면 임계와 무관하게 조언 표시
+        show_advice = False
+        if not is_stable:
+            if r < 0.60:
+                show_advice = True
+            elif is_borderline and dom != "in":
+                show_advice = (
+                    (r < 0.75) or
+                    (ev["hours"] >= 6.0) or
+                    (out_cnt >= max(5, int(ev["total"] * 0.20)))
+                )
+
+        # 3) 우세 방향에 따른 액션 가이드 (show_advice가 참일 때만)
         advice = ""
-        if key == "temperature":
-            advice = ("낮에는 환기·차광을 해주세요." if dom == "high"
-                      else ("야간 보온에 신경 써주세요." if dom == "low" else ""))
-        elif key == "humidity":
-            advice = ("분무나 가습을 조금 더 자주 해주세요." if dom == "low"
-                      else ("환기로 과습을 방지해 주세요." if dom == "high" else ""))
-        elif key == "light_lux":
-            advice = ("조금 더 밝은 위치로 옮겨주세요." if dom == "low"
-                else ("직사광선이 강하면 커튼이나 가림막을 사용해 주세요." if dom == "high" else ""))
-        elif key == "soil_temp":
-            advice = ("뿌리 과열을 막기 위해 차광·환기를 해주세요." if dom == "high"
-                else ("보온 덮개나 따뜻한 위치로 옮겨 주세요." if dom == "low" else ""))
-        elif key == "soil_moisture":
-            advice = ("급수 주기를 하루 당겨 보세요." if dom == "low"
-                      else ("과습 주의, 배수·통풍을 점검해 주세요." if dom == "high" else ""))
-        elif key == "soil_ec":
-            advice = ("희석 급수로 염류를 씻어내 주세요." if dom == "high"
-                      else ("비료 농도와 급수 빈도를 점검해 주세요." if dom == "low" else ""))
+        if show_advice:
+            if key == "temperature":
+                advice = ("낮에는 환기·차광을 해주세요." if dom == "high"
+                          else ("야간 보온에 신경 써주세요." if dom == "low" else ""))
+            elif key == "humidity":
+                advice = ("분무나 가습을 조금 더 자주 해주세요." if dom == "low"
+                          else ("환기로 과습을 방지해 주세요." if dom == "high" else ""))
+            elif key == "light_lux":
+                advice = ("조금 더 밝은 위치로 옮겨주세요." if dom == "low"
+                          else ("직사광선이 강하면 커튼이나 가림막을 사용해 주세요." if dom == "high" else ""))
+            elif key == "soil_temp":
+                advice = ("뿌리 과열을 막기 위해 차광·환기를 해주세요." if dom == "high"
+                          else ("보온 덮개나 따뜻한 위치로 옮겨 주세요." if dom == "low" else ""))
+            elif key == "soil_moisture":
+                advice = ("급수 주기를 하루 당겨 보세요." if dom == "low"
+                          else ("과습 주의, 배수·통풍을 점검해 주세요." if dom == "high" else ""))
+            elif key == "soil_ec":
+                advice = ("희석 급수로 염류를 씻어내 주세요." if dom == "high"
+                          else ("비료 농도와 급수 빈도를 점검해 주세요." if dom == "low" else ""))
 
         text = f"<b>{label}</b>: {status}"
         if advice:
             text += f"<br/><font color='#64748B'>{advice}</font>"
+        else:
+            text += "<br/>&nbsp;"
         return text
 
     # 각 센서 항목별 불릿 코멘트
@@ -910,7 +975,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
             ai_lines.append(Paragraph("• " + line, styles['AiBoxText']))
 
     if ai_lines:
-        ai_title = Paragraph("이번 주 요약 & 다음 주 관리 팁", styles['AiBoxTitle'])
+        ai_title = Paragraph("이번 주 요약 & 다음 주 관리 Tip", styles['AiBoxTitle'])
         # 타이틀 아래 얇은 구분선
         title_rule = Table([[ai_title]], colWidths=[doc.width-12*mm])
         title_rule.setStyle(TableStyle([
@@ -918,7 +983,7 @@ def generate_pdf_report_by_device(device_id, start_dt, end_dt, friendly_name, pl
             ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING',(0,0), (-1,-1), 0),
             ('TOPPADDING',  (0,0), (-1,-1), 0),
-            ('BOTTOMPADDING',(0,0),(-1,-1), 2),
+            ('BOTTOMPADDING',(0,0),(-1,-1), 6),
         ]))
 
         # 요약 목록을 2열(3개/3개) 테이블로 구성해 높이 절감
@@ -1105,8 +1170,47 @@ def send_all_reports_grouped(days: int = 7):
         send_email_with_pdfs(email, subject, body, pdfs)
     print(f"--- 그룹 전송 완료 ---\n")
 
+def send_all_reports_grouped_between(start: datetime, end: datetime):
+    """
+    지정한 UTC 기간 [start, end]으로 사용자별 PDF를 모아 한 통으로 발송.
+    (상단 cards/그래프/캡션 등은 이미 start/end를 받아 동작)
+    """
+    print(f"\n--- 그룹 전송(지정 기간) 시작: {start} ~ {end} ---")
+    _users   = get_all_users() or []
+    users    = [dict(u) if not isinstance(u, dict) else u for u in _users]
+    _devices = get_all_devices_any() or []
+    devices  = [dict(d) if not isinstance(d, dict) else d for d in _devices]
+    for u in users:
+        email = u.get("email"); uid = u.get("id")
+        if not email or uid is None:
+            continue
+        owned = [d for d in devices if str(d.get("owner_user_id")) == str(uid)]
+        if not owned:
+            _owned = get_all_devices(uid) or []
+            owned  = [dict(d) if not isinstance(d, dict) else d for d in _owned]
+        if not owned:
+            print(f"[INFO] skip {email}: no devices"); continue
+        pdfs = []
+        for d in owned:
+            dev   = d.get("device_id")
+            fname = d.get("friendly_name") or dev
+            plant = d.get("plant_type"); room = d.get("room")
+            print(f"[INFO] generate PDF → user={email}, device={dev} ({fname})")
+            path = generate_pdf_report_by_device(dev, start, end, fname, plant, room)
+            pdfs.append(path)
+        # 제목에 디바이스 수 + 기간(KST) 요약까지 포함하면 메일함에서 식별이 쉬움
+        kst = pytz.timezone("Asia/Seoul")
+        s_k = start.astimezone(kst).strftime("%Y-%m-%d")
+        e_k = (end - timedelta(seconds=1)).astimezone(kst).strftime("%Y-%m-%d")
+        subject = f"GreenEye 주간 식물 보고서 ({s_k}~{e_k}) - {len(pdfs)}대"
+        body    = "안녕하세요, GreenEye입니다.\n주간 식물 생장 보고서를 보내드립니다."
+        send_email_with_pdfs(email, subject, body, pdfs)
+    print(f"--- 그룹 전송(지정 기간) 완료 ---\n")
+   
 if __name__ == "__main__":
-    send_all_reports_grouped()
+    now_utc = datetime.now(pytz.utc)
+    start_utc, end_utc = week_window_kst(now_utc)
+    send_all_reports_grouped_between(start_utc, end_utc)
     # --- InfluxDB 클라이언트 정리 ---
     try:
         cli = get_influx_client()

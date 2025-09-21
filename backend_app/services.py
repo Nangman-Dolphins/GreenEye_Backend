@@ -101,6 +101,12 @@ INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
 INFLUXDB_ORG = os.getenv("INFLUXDB_ORG")
 INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "sensor_readings")
 
+# 컨테이너 안에서 'localhost'로 잡히면 서비스명으로 강제 전환
+_env_mode = os.getenv("ENV_MODE", "docker").lower()
+if _env_mode == "docker":
+    if INFLUXDB_URL.startswith("http://localhost") or INFLUXDB_URL.startswith("http://127.0.0.1"):
+        INFLUXDB_URL = "http://influxdb:8086"
+
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
@@ -137,6 +143,7 @@ def connect_redis():
 def connect_influxdb():
     """InfluxDB v2 연결"""
     global influxdb_client, influxdb_write_api, query_api
+    print(f"[InfluxDB] connecting url={INFLUXDB_URL}, org={INFLUXDB_ORG}, bucket={INFLUXDB_BUCKET}")
     try:
         influxdb_client = InfluxDBClient(
             url=INFLUXDB_URL,

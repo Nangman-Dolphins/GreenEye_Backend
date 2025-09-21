@@ -1,0 +1,2 @@
+CRON_TZ=Asia/Seoul
+5 0 * * 1 python -m backend_app.report_generator
