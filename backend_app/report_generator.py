@@ -92,6 +92,23 @@ EMAIL_USERNAME = os.getenv("EMAIL_USERNAME")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET") or "sensor_data"
 
+def _has_email_consent(user_row) -> bool:
+    """
+    users 테이블에 email_consent(0/1)가 있으면 True/False로 변환하여 반환.
+    - sqlite3.Row / dict 모두 안전하게 처리
+    - 컬럼이 없거나 조회 실패 시 False(미동의)로 간주
+    """
+    try:
+        if isinstance(user_row, dict):
+            return bool(user_row.get("email_consent", 0))
+        # sqlite3.Row
+        keys = getattr(user_row, "keys", lambda: [])()
+        if "email_consent" in keys:
+            return bool(user_row["email_consent"])
+        return False
+    except Exception:
+        return False
+
 def week_window_kst(reference_utc: datetime) -> tuple[datetime, datetime]:
     """
     기준 UTC 시각을 받아 KST에서 '지난주 월 00:00 ~ 이번주 월 00:00' 경계를 UTC로 반환.
@@ -1114,6 +1131,14 @@ def send_all_reports():
     start = now - timedelta(days=7)
 
     for user in users:
+        # 동의하지 않은 사용자는 스킵
+        if not _has_email_consent(user):
+            try:
+                _email_dbg = user["email"] if not isinstance(user, dict) else user.get("email")
+            except Exception:
+                _email_dbg = None
+            print(f"[INFO] skip user={_email_dbg}: email_consent=0")
+            continue
         email = user["email"]
         for device in devices:
             pdf = generate_pdf_report_by_device(
@@ -1140,6 +1165,10 @@ def send_all_reports_grouped(days: int = 7):
     start    = now - timedelta(days=days)
 
     for u in users:
+        # 동의하지 않은 사용자는 스킵
+        if not bool(u.get("email_consent", 0)):
+            print(f"[INFO] skip user={u.get('email')}: email_consent=0")
+            continue
         email = u.get("email")
         uid   = u.get("id")
         if not email or uid is None:
@@ -1181,6 +1210,10 @@ def send_all_reports_grouped_between(start: datetime, end: datetime):
     _devices = get_all_devices_any() or []
     devices  = [dict(d) if not isinstance(d, dict) else d for d in _devices]
     for u in users:
+        # 동의하지 않은 사용자는 스킵
+        if not bool(u.get("email_consent", 0)):
+            print(f"[INFO] skip user={u.get('email')}: email_consent=0")
+            continue
         email = u.get("email"); uid = u.get("id")
         if not email or uid is None:
             continue

@@ -77,6 +77,14 @@ def init_db():
         )
     """)
 
+    # 이메일 보고서 동의 (기본 0=미동의)
+    try:
+        if not _column_exists(conn, "users", "email_consent"):
+            conn.execute("ALTER TABLE users ADD COLUMN email_consent INTEGER DEFAULT 0")
+            conn.commit()
+    except Exception:
+        pass
+    
     # 2) devices
     cur.execute("""
         CREATE TABLE IF NOT EXISTS devices (
@@ -158,6 +166,23 @@ def init_db():
         pass
     conn.close()
     
+def set_email_consent(user_id: int, consent: bool) -> None:
+    """사용자의 이메일 발송 동의 여부 저장"""
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE users SET email_consent=? WHERE id=?",
+            (1 if consent else 0, user_id),
+        )
+        conn.commit()
+
+def get_email_consent(user_id: int) -> bool:
+    """사용자의 이메일 발송 동의 여부 조회 (없으면 False)"""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT email_consent FROM users WHERE id=?",
+            (user_id,)
+        ).fetchone()
+        return bool(row["email_consent"]) if row and "email_consent" in row.keys() else False
 
 def add_user(email, password):
     conn = get_db_connection()

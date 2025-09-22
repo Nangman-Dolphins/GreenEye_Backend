@@ -44,6 +44,8 @@ from .database import (
     get_device_by_device_id_any,               
     get_all_devices,
     get_all_devices_any,
+    set_email_consent,
+    get_email_consent,
 )
 
 from backend_app.database import get_db_connection  # 최신 이미지 DB 폴백용
@@ -550,6 +552,24 @@ def api_latest_sensor_data(device_id):
     if ai:
         resp["ai_diagnosis"] = ai
     return jsonify(resp)
+
+# ─────────────────────────────────────────────────────
+# 이메일 보고서 발송 동의 저장/조회 API
+# ─────────────────────────────────────────────────────
+@app.get("/api/user/email-consent")
+@token_required
+def api_get_email_consent():
+    user_id = g.current_user["id"]
+    return jsonify({"email_consent": bool(get_email_consent(user_id))})
+
+@app.put("/api/user/email-consent")
+@token_required
+def api_put_email_consent():
+    user_id = g.current_user["id"]
+    data = request.get_json(silent=True) or {}
+    consent = bool(data.get("email_consent", False))
+    set_email_consent(user_id, consent)
+    return jsonify({"ok": True, "email_consent": consent})
 
 def _to_num(v):
     try:
