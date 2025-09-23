@@ -410,7 +410,7 @@ def init_runtime_and_scheduler():
                     friendly_name = device['friendly_name']
                     print(f"[init] ⏳ Scheduling jobs for {friendly_name} ({device_id})")
 
-                    scheduler.add_job(check_and_apply_auto_control, "interval", minutes=1, args=[device_id], id=f"auto_control_job_{device_id}", replace_existing=True)
+                    # scheduler.add_job(check_and_apply_auto_control, "interval", minutes=1, args=[device_id], id=f"auto_control_job_{device_id}", replace_existing=True)
                     scheduler.add_job(send_realtime_data_to_clients, "interval", seconds=5, args=[device_id], id=f"realtime_data_job_{device_id}", replace_existing=True)
                 except Exception as inner_e:
                     print(f"[init] ❌ Error scheduling job for device: {device} -> {inner_e}")
