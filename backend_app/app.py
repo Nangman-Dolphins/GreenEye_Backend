@@ -1,4 +1,4 @@
-import os, secrets
+import os, secrets, shutil
 import json
 import uuid
 import pytz
@@ -131,6 +131,42 @@ IMAGE_UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), "
 ALLOWED_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp"}
 DEFAULT_SHARED_PREFIXES = {"default_", "common_"}  # 공용 이미지 삭제 방지 접두사
 os.makedirs(IMAGE_UPLOAD_FOLDER, exist_ok=True)
+
+# 이미지 정리 간격 조정 변수(단위 : 주)
+IMAGE_CLEANUP_INTERVAL_WEEKS = 2
+
+
+def clear_image_upload_folder():
+    """Remove device-uploaded images while keeping shared assets."""
+    tz = pytz.timezone('Asia/Seoul')
+    removed = 0
+    skipped = 0
+    errors = []
+    timestamp = None
+    try:
+        for entry in os.listdir(IMAGE_UPLOAD_FOLDER):
+            if any(entry.startswith(prefix) for prefix in DEFAULT_SHARED_PREFIXES):
+                skipped += 1
+                continue
+            abs_path = os.path.join(IMAGE_UPLOAD_FOLDER, entry)
+            try:
+                if os.path.isdir(abs_path):
+                    shutil.rmtree(abs_path)
+                    removed += 1
+                elif os.path.isfile(abs_path) or os.path.islink(abs_path):
+                    os.remove(abs_path)
+                    removed += 1
+            except Exception as inner_exc:
+                errors.append(f"{entry}: {inner_exc}")
+        timestamp = datetime.now(tz).isoformat()
+        print(f"[cleanup] IMAGE_UPLOAD_FOLDER cleared at {timestamp}. removed={removed}, skipped={skipped}")
+        if errors:
+            print(f"[cleanup] Errors during cleanup: {errors}")
+    except Exception as exc:
+        timestamp = datetime.now(tz).isoformat()
+        errors.append(str(exc))
+        print(f"[cleanup] Failed to clear IMAGE_UPLOAD_FOLDER: {exc}")
+    return {"timestamp": timestamp, "removed": removed, "skipped": skipped, "errors": errors}
 
 def _allowed_ext(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTS
@@ -417,6 +453,14 @@ def init_runtime_and_scheduler():
 
         scheduler.add_job(send_all_reports, "cron", day="1", hour="0", minute="5", id="monthly_report_job", replace_existing=True)
         print("[init] ✅ Scheduled monthly report job to run on the 1st of every month at 00:05")
+        scheduler.add_job(
+            clear_image_upload_folder,
+            "interval",
+            weeks=IMAGE_CLEANUP_INTERVAL_WEEKS,
+            id="cleanup_device_images_job",
+            replace_existing=True,
+        )
+        print(f"[init] ✅ Scheduled image cleanup job to run every {IMAGE_CLEANUP_INTERVAL_WEEKS} weeks")
 
         scheduler.start()
         print("[init] ✅ APScheduler started.")
@@ -425,6 +469,14 @@ def init_runtime_and_scheduler():
         import traceback
         print("[init] ❌ Exception occurred in init_runtime_and_scheduler:")
         traceback.print_exc()
+
+@app.post("/api/debug/run-image-cleanup")
+def debug_run_image_cleanup():
+    """Run the image cleanup immediately when debugging locally."""
+    if ENV not in ("development", "dev", "debug"):
+        return jsonify({"error": "Manual cleanup is disabled outside debug environments."}), 403
+    result = clear_image_upload_folder()
+    return jsonify({"status": "ok", **result})
 
 @app.route("/")
 def home():
@@ -1116,8 +1168,45 @@ def chat_with_gemini():
             
             contents.append({"role": role, "parts": parts})
 
-        # API 요청 준비
+
+        # 시스템 프롬포트 for Sae-Sol
+        system_prompt_content = {
+            "parts": [
+                {
+                    "text": """You are Sae-Sol, a PhD-level botanist and meticulous plant-care specialist.
+
+        Core Principles
+        - Be concise (≤180 words or ≤8 sentences).
+        - Recommendations must be scientifically verified and actionable with units.
+        - Never guess; state uncertainty and confidence.
+        - Prioritize plant health and safety; follow pesticide labels and local regulations.
+
+        Required Inputs (ask only if missing)
+        Species/cultivar; pot & medium; substrate pH/EC; watering/fertilization history; light level (PPFD/Lux & distance); temperature/RH; pest/disease signs (photos); recent changes.
+
+        Response Structure
+        1) Assessment (hypothesis + confidence %)
+        2) Likely Causes (ranked)
+        3) Actions (checklist with SI units)
+        4) Monitoring (what/when; expected timeline)
+        5) Prevention (cultural controls; quarantine)
+        6) Red Flags (when to seek in-person help)
+
+        Uncertainty Handling
+        - If confidence <60%, provide differentials and low-risk universal interventions only.
+        - If severe decline suspected, recommend consulting a professional botanist/horticulturist.
+
+        Evidence & Citations
+        - Include 1–2 authoritative sources each reply (university Extension, peer-reviewed texts).
+        - Flag pet/child toxicity when relevant."""
+                }
+            ]
+        }
+
+
+        # API 요청 페이로드 구성
         payload = {
+            "systemInstruction": system_prompt_content, # 시스템 프롬프트를 Payload에 추가
             "contents": contents,
             "generationConfig": {
                 "temperature": 0.7,
