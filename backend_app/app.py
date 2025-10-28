@@ -234,6 +234,7 @@ def _image_public_url(device_id: str, filename: str) -> str:
     """
     if not filename:
         return None
+    filename += "_wstamp.jpg"
     safe = secure_filename(filename)
     return f"/api/images/{device_id}/{safe}"
 
@@ -260,11 +261,15 @@ def _compose_latest_image_payload(device, include_ai: bool = True):
     - AI 진단은 Redis `latest_ai_diagnosis:{device_id}` 에서 함께 포함(선택)
     """
     device_id = device["device_id"]
+    print(device_id)
 
     # Redis 최신 포인터 조회
+    print("latest pointer")
     latest = get_redis_data(f"latest_image:{device_id}") or {}
     filename = latest.get("filename")
     timestamp = latest.get("timestamp")
+    print(filename)
+    print(timestamp)
 
     # 폴백: DB 최근 이미지 1건
     if not filename:
@@ -272,8 +277,11 @@ def _compose_latest_image_payload(device, include_ai: bool = True):
         if row:
             # services.py는 filepath에 풀 경로, filename에는 접두 없는 파일명 저장
             # 여기서는 filename만 쓰고, 내려줄 URL은 기존 이미지 라우트로 구성
+            print("cannot found!")
             filename = row.get("filename")
             timestamp = row.get("timestamp")
+            print(filename)
+            print(timestamp)
 
     payload = {
         "device_id": device_id,
@@ -282,6 +290,7 @@ def _compose_latest_image_payload(device, include_ai: bool = True):
         "timestamp": timestamp,
         "image_url": _image_public_url(device_id, filename) if filename else None,
     }
+    print(payload)
 
     # (옵션) 최신 AI 진단 포함
     if include_ai:
@@ -301,12 +310,19 @@ def api_latest_image(device_id: str):
     - 최종 URL은 기존 `/api/images/<device_id>/<filename>` 로 접근
     """
     owner_user_id = g.current_user["id"]
-    dev = get_device_by_device_id(device_id, owner_user_id)
+    mac_addr = device_id[-4:]
+    dev = get_device_by_device_id(mac_addr, owner_user_id)
+    print(mac_addr)
+    print(device_id)
+    print(owner_user_id)
     if not dev:
+        print("Device not found")
         return jsonify({"error": "Device not found"}), 404
 
     info = _compose_latest_image_payload(dev, include_ai=True)
+    print(info)
     if not info.get("filename"):
+        print("error no image!")
         return jsonify({"error": "No image found"}), 404
     return jsonify(info), 200
 
@@ -956,11 +972,17 @@ def register_device():
 @app.route("/api/images/<device_id>/<filename>")
 @token_required
 def get_image(device_id: str, filename: str):
+    print("image req!!")
     owner_user_id = g.current_user["id"]
+    print(device_id)
+    print(owner_user_id)
     dev = get_device_by_device_id(device_id, owner_user_id)
     if not dev:
+        print("404!")
         return jsonify({"error": "Device not found"}), 404
+    print(filename)
     safe_filename = secure_filename(filename)
+    print(send_from_directory(IMAGE_UPLOAD_FOLDER, safe_filename))
     return send_from_directory(IMAGE_UPLOAD_FOLDER, safe_filename)
 
 
@@ -983,13 +1005,17 @@ def upload_device_image(device_id: str):
 
     owner_user_id = g.current_user["id"]
     dev = get_device_by_device_id(device_id, owner_user_id)
+    print(device_id)
+    print(owner_user_id)
     if not dev:
+        print("Device not found")
         return jsonify({"error": "Device not found"}), 404
 
     if not (request.content_type and "multipart/form-data" in request.content_type):
         return jsonify({"error": "Content-Type must be multipart/form-data"}), 400
 
     file = request.files.get("image")
+    print(file.filename)
     if not file or not file.filename:
         return jsonify({"error": "Missing file 'image'"}), 400
 

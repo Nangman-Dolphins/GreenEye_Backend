@@ -201,7 +201,7 @@ def on_message(client, userdata, msg):
 
 
 def connect_mqtt():
-    # 환경변수에서 가져오되 없으면 기본값 사용
+    # ✅ 환경변수에서 가져오되 없으면 기본값 사용
     broker_host = os.getenv("MQTT_BROKER_HOST", "localhost")
     broker_port = int(os.getenv("MQTT_BROKER_PORT", 1883))
 
@@ -244,7 +244,7 @@ def write_sensor_data_to_influxdb(measurement, tags, fields, ts=None):
             point.field(k, v)
     
 
-    # 타임스탬프 반영 (ISO8601 / epoch seconds / epoch ms 모두 허용)
+    # ✅ 타임스탬프 반영 (ISO8601 / epoch seconds / epoch ms 모두 허용)
     if ts:
         try:
             ts_dt = None
@@ -346,7 +346,7 @@ def get_redis_data(key: str):
         data = redis_client.get(key)
         if not data:
             return None
-        # Redis에 BOM/비표준 JSON이 들어와도 복구 시도
+        # ✅ Redis에 BOM/비표준 JSON이 들어와도 복구 시도
         if isinstance(data, str):
             try:
                 return json.loads(data)
@@ -460,7 +460,7 @@ def process_incoming_data(topic: str, payload):
 
                     brightness_factor = 1.2   # 20% brighter
                     contrast_factor   = 1.2   # 20% more contrast
-                    saturation_factor = 3.0   # 300% more saturation
+                    saturation_factor = 1.2   # 20% more saturation
                     sharpness_factor  = 1.3   # 30% more sharpness
 
                     with Image.open(BytesIO(image_dec)) as img:
@@ -485,7 +485,7 @@ def process_incoming_data(topic: str, payload):
                     draw = ImageDraw.Draw(img_with_stamp)
 
                     current_time = datetime.now()
-                    timestamp_text = current_time.strftime('{device_id}_%Y-%m-%d %H:%M:%S')
+                    timestamp_text = current_time.strftime(f"{device_id}_%Y-%m-%d %H:%M:%S")
 
                     try:
                         font = ImageFont.truetype("arial.ttf", size=20) #font select
@@ -768,7 +768,7 @@ def parse_csv_result(decoded_csv: str):
         print(f"[DEBUG] parsed_sample_keys={list(rows[0].keys())}")
     return rows
 
-# --- 한줄평 로더 ---
+# --- 한줄평 로더 (추가) ---
 _comment_cache = {}
 
 def get_plant_comment(primary_key: str = None, fallback_key: str = None) -> str:
@@ -792,13 +792,13 @@ def get_plant_comment(primary_key: str = None, fallback_key: str = None) -> str:
                 "_error": "분석 중 오류가 발생했습니다."
             }
 
-    # 1. 주요 키로 먼저 검색
+    # 1. 주요 키 (e.g., "Rose_healthy")로 먼저 검색
     if primary_key:
         comment = _comment_cache.get(primary_key)
         if comment:
             return comment
 
-    # 2. 주요 키가 없을 경우, 대체 키로 검색
+    # 2. 주요 키가 없을 경우, 대체 키 (e.g., "healthy")로 검색
     if fallback_key:
         comment = _comment_cache.get(fallback_key)
         if comment:
