@@ -34,13 +34,14 @@
 
 * **원격 제어 (API → MQTT)**
 
-   * 사용자가 `Frontend` 의 `ControlPanel` 에서 제어 버튼(예: 워터펌프 ON) 을 클릭하거나 동작 모드를 변경한다.
+   * 사용자가 `Frontend` 의 `ControlPanel` 에서 제어 버튼(예: 워터펌프 ON)를 조작한다.
 
-   * `Frontend` 는 `Flask` 의 `/api/control_device/{id}` 엔드포인트로 **수동 제어 명령이 담긴 JSON** 을 POST 하거나, `/api/control_mode/{id}` 로 **모드 변경 요청** (예: `ultra_low`, `normal` 등) 을 전송한다.
+      * `Frontend`는 Flask의 `/api/control_device/{id}` 엔드포인트로 수동 제어 명령이 담긴 JSON을 POST하여 연결된 장치에 커맨드를 보낼 수 있다.
 
-   * `Flask` 서버는 이 요청 JSON 을 검증한 후, 해당 기기의 `GreenEye/conf/{id}` 토픽으로 **동일하거나 유사한 JSON 페이로드** 를 발행한다.
+   * 또는 사용자가 장치 설정에서 장치에 대한 모드 및 설정을 조작한다.
 
-   * `SensorDevice` (ESP32) 가 이 메시지를 수신하여 실제 액추에이터를 작동시킨다.
+      * 이 경우 해당 기기의 `GreenEye/conf/{id}` 토픽으로 사용자가 변경한 설정에 대해 JSON에 정보를 담아 POST한다.
+      * `SensorDevice`가 이 메시지를 수신하여 설정을 적용시킨다.
 
 * **AI 연동**
 
