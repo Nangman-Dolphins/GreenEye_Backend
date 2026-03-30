@@ -383,9 +383,16 @@ def run_inference_on_image(device_id: str, image_path: str):
         # device 정보에서 plant_type 가져오기 시도
         device_info = get_device_by_device_id_any(device_id)
         if device_info and device_info.get('plant_type'):
-            plant_type = device_info['plant_type']
+            raw_plant_type = device_info['plant_type']
+            
+            # find text inside parentheses
+            # fallback to raw string if no match
+            match = re.search(r'\((.*?)\)', raw_plant_type)
+            if match:
+                plant_type = match.group(1).strip()
+            else:
+                plant_type = raw_plant_type
         
-        # model_manager를 사용하여 추론 수행
         result = model_manager.predict(image_bytes, plant_type)
 
         if "error" in result:
